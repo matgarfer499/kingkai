@@ -1,0 +1,30 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000005",
+  "permission_mode": "default",
+  "agent_id": "adf7bd5ddbd85bae7",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/home/user/dev/demo/src/big.ts",
+    "limit": 5
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/home/user/dev/demo/src/big.ts",
+      "content": "export const v1 = 1; // line 1\nexport const v2 = 2; // line 2\nexport const v3 = 3; // line 3\nexport const v4 = 4; // line 4\nexport const v5 = 5; // line 5",
+      "numLines": 5,
+      "startLine": 1,
+      "totalLines": 301
+    }
+  },
+  "tool_use_id": "toolu_01X2dcKqDToJDPPTg5BmMV1Z",
+  "duration_ms": 16
+}

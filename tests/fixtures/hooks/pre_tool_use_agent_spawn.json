@@ -1,0 +1,18 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000005",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Read lines 1-5 of big.ts",
+    "prompt": "Read lines 1-5 of /home/user/dev/demo/src/big.ts and report their exact text, one per line. Do nothing else.",
+    "subagent_type": "general-purpose"
+  },
+  "tool_use_id": "toolu_01CimxL3vekQWwkeKoAHvd9k"
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000003",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "<task-notification>\n<task-id>adf7bd5ddbd85bae7</task-id>\n<tool-use-id>toolu_01CimxL3vekQWwkeKoAHvd9k</tool-use-id>\n<output-file>/tmp/scratch\n<status>completed</status>\n<summary>Agent \"Read lines 1-5 of big.ts\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Here are lines 1–5 of `/home/user/dev/demo/src/big.ts`, exactly as they appear:\n\n```\nexport const v1 = 1; // line 1\nexport const v2 = 2; // line 2\nexport const v3 = 3; // line 3\nexport const v4 = 4; // line 4\nexport const v5 = 5; // line 5\n```</result>\n<usage><subagent_tokens>42086</subagent_tokens><tool_uses>1</tool_uses><duration_ms>5813</duration_ms></usage>\n</task-notification>"
+}

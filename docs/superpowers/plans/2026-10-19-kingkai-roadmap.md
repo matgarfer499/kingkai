@@ -32,7 +32,7 @@
 - mypy `--strict` must pass, with no `Any` outside `adapters/*/schema.py`.
 - Never name a Textual attribute `tree`. Write `BINDINGS: ClassVar[list[BindingType]]`.
 - The typed text must match `^@(?:[\w.\-()\[\]@+]+/)*[\w.\-()\[\]@+]+(?:#L|:)[1-9][0-9]* $`.
-- tmux argv is exactly `["tmux","send-keys","-t",<pane>,"-l","--",<text>]`.
+- tmux delivery is exactly `["tmux","load-buffer","-b",<buf>,"-"]` (text on stdin), then `["tmux","paste-buffer","-p","-d","-b",<buf>,"-t",<pane>]`. kingkai never calls `send-keys` (Spike 0b).
 - The HTTP server binds `127.0.0.1` only, on port 0. Bodies are limited to 4096 bytes and requests to 5 per second.
 - Hooks are installed only in `.claude/settings.local.json`, with `"async": true, "timeout": 5`. The command is the shim `~/.local/state/kingkai/bin/kingkai-hook`.
 - File modes: spool dir 0700, spool and session files 0600.
@@ -97,29 +97,29 @@ git commit -m "docs(spikes): record react 19 source-location findings"
 - Create: `tests/fixtures/hooks/*.json` (real payloads recorded with a 5-line logging hook during the same run, then scrubbed by hand: replace `/home/<user>` with `/home/user` and session ids with `00000000-…`)
 - Scratch, not committed: the logging hook script, and a scratch project with a 300-line file, an `app/(group)/[slug]/page.tsx` path and a nested directory.
 
-- [ ] **Step 1: Set up the scratch project.** In tmux, run `claude` in pane %A. Install a temporary logging command hook for every event in §4.1 into the scratch project's `.claude/settings.local.json`. The hook appends stdin to `/tmp/kk-spike-hooks.ndjson`.
-- [ ] **Step 2: Test the separator (Q3).** Run `tmux send-keys -t %A -l -- '@src/big.ts#L120 '` and observe the prompt. Then type "what is on that line?" by hand and press Enter. Record whether the mention resolved (it shows as a file chip, or the file is attached) and whether the model answered about line 120. Repeat with `@src/big.ts:120 `.
-- [ ] **Step 3: Test autocomplete and the cursor (Q4).**
+- [x] **Step 1: Set up the scratch project.** In tmux, run `claude` in pane %A. Install a temporary logging command hook for every event in §4.1 into the scratch project's `.claude/settings.local.json`. The hook appends stdin to `/tmp/kk-spike-hooks.ndjson`.
+- [x] **Step 2: Test the separator (Q3).** Run `tmux send-keys -t %A -l -- '@src/big.ts#L120 '` and observe the prompt. Then type "what is on that line?" by hand and press Enter. Record whether the mention resolved (it shows as a file chip, or the file is attached) and whether the model answered about line 120. Repeat with `@src/big.ts:120 `.
+- [x] **Step 3: Test autocomplete and the cursor (Q4).**
   - Type with the `@` menu open: does the trailing space close it, and is the text altered?
   - With text already typed and the cursor in the middle, is the reference inserted at the cursor?
   - Type while Claude is working: is the text queued?
-- [ ] **Step 4: Test dialogs (Q-S9).** Trigger a permission prompt (ask Claude to run `touch x` in default mode). While it is open:
+- [x] **Step 4: Test dialogs (Q-S9).** Trigger a permission prompt (ask Claude to run `touch x` in default mode). While it is open:
   - capture the screen into `tests/fixtures/screens/permission_prompt.txt`;
   - send `@src/big.ts#L12 ` with `send-keys -l` and record what happens (did an option get selected?);
   - repeat with `tmux load-buffer` plus `paste-buffer -p -t %A`.
 
   Also capture the `/` menu screen and the idle prompt screen. Write down 1–3 **stable substrings** that identify each dialog.
-- [ ] **Step 5: Test paths and process names (Q5, Q6).** Type `@app/(group)/[slug]/page.tsx#L3 ` and record whether it resolves. Record `#{pane_current_command}` for the installed claude.
-- [ ] **Step 6: Collect fixtures.** Run a task that launches 2 subagents in parallel and makes one tool fail 3 times. Copy the hook log, split it into one file per event type (`session_start.json`, `pre_tool_use_main.json`, `pre_tool_use_subagent.json`, `post_tool_use_failure.json`, `subagent_start.json`, `subagent_stop.json`, `notification_permission.json`, `stop.json`, `session_end.json`), scrub it, and save it under `tests/fixtures/hooks/`. Also copy about 30 transcript lines that include assistant `usage` (main and subagent) to `tests/fixtures/transcripts/` (scrubbed). Record the Claude Code version (`claude --version`) in `tests/fixtures/README.md`.
-- [ ] **Step 7: Write `docs/spikes/0b-tmux-typing.md`.** It answers Q3–Q8 (Q7 is `agent_id` on subagent events, Q8 is usage repetition) and gives a recommendation for Q-S9 with evidence. Update spec §8.4, §13 and the default `ReferenceFormat`.
-- [ ] **Step 8: Grep for anything that shouldn't be public.**
+- [x] **Step 5: Test paths and process names (Q5, Q6).** Type `@app/(group)/[slug]/page.tsx#L3 ` and record whether it resolves. Record `#{pane_current_command}` for the installed claude.
+- [x] **Step 6: Collect fixtures.** Run a task that launches 2 subagents in parallel and makes one tool fail 3 times. Copy the hook log, split it into one file per event type (`session_start.json`, `pre_tool_use_main.json`, `pre_tool_use_subagent.json`, `post_tool_use_failure.json`, `subagent_start.json`, `subagent_stop.json`, `notification_permission.json`, `stop.json`, `session_end.json`), scrub it, and save it under `tests/fixtures/hooks/`. Also copy about 30 transcript lines that include assistant `usage` (main and subagent) to `tests/fixtures/transcripts/` (scrubbed). Record the Claude Code version (`claude --version`) in `tests/fixtures/README.md`.
+- [x] **Step 7: Write `docs/spikes/0b-tmux-typing.md`.** It answers Q3–Q8 (Q7 is `agent_id` on subagent events, Q8 is usage repetition) and gives a recommendation for Q-S9 with evidence. Update spec §8.4, §13 and the default `ReferenceFormat`.
+- [x] **Step 8: Grep for anything that shouldn't be public.**
 
 ```bash
 grep -rniEf ~/.config/kingkai-dev/private-terms.txt docs tests   # patterns live outside the repo
 ```
 
 Expected: no output.
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add docs/spikes/0b-tmux-typing.md tests/fixtures docs/superpowers/specs/2026-10-19-kingkai-design.md
@@ -205,7 +205,7 @@ Expected: all CI jobs are green.
   - `SessionId`, `AgentId`, `ToolUseId`, `EventId`: `NewType(str)`.
   - `AgentRef = MainAgent | SubAgent`, where `MainAgent` is a singleton dataclass and `SubAgent(agent_id: AgentId)`.
   - The `DomainEvent` union: every event in spec §4.2 except `UsageRecorded`, `Tick` and `ReplayCompleted`, which Phase 2 adds. Each has the base fields `session_id: SessionId`, `event_id: EventId`, `at: datetime`.
-  - `ToolCall(tool_use_id, agent, tool, input_fingerprint, touches, status: Literal["running","succeeded","failed"], started_at: datetime | None, ended_at: datetime | None, duration_ms: int | None, error_summary: str | None)`.
+  - `ToolCall(tool_use_id, agent, tool, input_fingerprint, touches, status: Literal["running","succeeded","failed","abandoned"], started_at: datetime | None, ended_at: datetime | None, duration_ms: int | None, error_summary: str | None)`.
   - `AgentNode(ref, agent_type, status: Literal["running","done"], started_at)`.
   - `SessionState(session_id, agents: Mapping[AgentRef, AgentNode], calls: Mapping[ToolUseId, ToolCall], call_order: tuple[ToolUseId, ...], touches: tuple[FileTouch, ...], turn_open: bool, awaiting_permission: frozenset[AgentRef], liveness: Literal["live","idle","ended"], last_activity: datetime | None, seen: frozenset[EventId], tmux_pane: str | None, transcript_path: str | None)`.
   - `SessionState.initial(session_id) -> SessionState`.
@@ -217,13 +217,17 @@ Expected: all CI jobs are green.
   - `test_duplicate_event_id_is_noop`: `reduce(reduce(s, e), e) == reduce(s, e)`.
   - `test_unknown_subagent_created_implicitly`: a `ToolCallStarted` with `SubAgent("a1")` and no `SubagentStarted` gives `agents[SubAgent("a1")].agent_type == "unknown"`.
   - `test_subagent_start_stop_lifecycle`.
-  - `test_permission_prompt_sets_flag_for_that_agent_only`.
+  - `test_permission_request_sets_flag_for_that_agent_only`.
   - `test_subagent_activity_does_not_clear_main_dialog_flag` (S9).
   - `test_late_notification_after_tool_start_still_blocks` (S9): a `Notification` with `at` earlier than an already-applied `Started` from the same agent still adds the flag, because flags clear only on events *applied after* them.
-  - `test_idle_prompt_does_not_block` (S9).
+  - `test_notification_never_blocks` (S9).
   - `test_permission_prompt_clears_on_next_tool_event` (S9).
   - `test_turn_stopped_clears_all_dialog_flags`.
   - `test_session_ended_sets_liveness_ended`.
+  - `test_running_calls_abandoned_on_next_turn_started` (Spike 0b: a cancelled dialog emits no end event).
+  - `test_running_calls_abandoned_on_session_end`.
+  - `test_system_turn_kind_from_task_notification_prompt`.
+  - `test_untyped_subagent_stop_for_unseen_agent_ignored` (auxiliary agents).
 - [ ] **Step 2: Run** `uv run pytest tests/domain/test_reducer.py -v`. Expected: FAIL, because `kingkai.domain.reducer` doesn't exist yet.
 - [ ] **Step 3: Implement** `ids.py`, `events.py` and `state.py`, then `reduce`.
   - `reduce` dispatches with a `match` on the event type to one private `_apply_<event>` function per event.
@@ -307,7 +311,7 @@ Expected: all CI jobs are green.
 
 **Interfaces:**
 - Produces:
-  - `HOOK_EVENTS: tuple[str, ...]`: the 11 events in spec §4.1, which are SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop, Notification, Stop, PreCompact and SessionEnd.
+  - `HOOK_EVENTS: tuple[str, ...]`: the 12 events in spec §4.1, which are SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop, PermissionRequest, Notification, Stop, PreCompact and SessionEnd.
   - `install(settings: Mapping[str, JsonValue], shim: str) -> dict[str, JsonValue]` and `uninstall(settings, shim) -> dict[str, JsonValue]`. Both are pure.
   - `write_shim(path: Path, python: str) -> None`: the file is mode 0755, its content is exactly the one-liner in spec §4.1, and it starts with `#!/bin/sh`.
   - `find_project_root(start: Path) -> Path | None`: walks up to the nearest directory that contains `.claude/` or `.git/`.
@@ -370,6 +374,7 @@ Expected: all CI jobs are green.
   - `to_domain(p: HookPayload) -> DomainEvent | None`, which returns `None` for event types kingkai ignores. `agent_id` present gives `SubAgent(agent_id)`; absent gives `MainAgent`. `event_id` comes from `_kk.id` and `at` from `_kk.at`.
 
 - [ ] **Step 1: Write failing tests.**
+  - `test_full_run_replays_to_expected_tree`: decoding and reducing `hooks/session_full_run.ndjson` gives 2 visible subagents (both `general-purpose`), 3 failed `Bash` calls, and no auxiliary agents.
   - One test per fixture file, asserting the exact domain event. For example, `test_pre_tool_use_subagent_fixture` asserts that `agent == SubAgent(<id in fixture>)` and that `touches` has the read path.
   - `test_unknown_event_returns_none`.
   - `test_unknown_fields_ignored` (add `"brand_new_field": 1`).
@@ -506,12 +511,12 @@ The thresholds are constructor arguments; the `Config` defaults are in spec §4.
 **Files:** `src/kingkai/assets/pricing.toml`, `adapters/pricing.py`, `domain/usage.py` (`Pricing`, `estimate_cost`), tests
 **Interfaces:**
 - `Pricing(per_mtok: Mapping[str, ModelPrice])`
-- `ModelPrice(input, output, cache_write, cache_read: Decimal)`
+- `ModelPrice(input, output, cache_write_5m, cache_write_1h, cache_read: Decimal)` (two cache-write tiers, Spike 0b)
 - `estimate_cost(usages, pricing) -> CostEstimate(total: Decimal | None, unknown_models: frozenset[str])`
 
 Fill `pricing.toml` from the official Anthropic pricing page at implementation time, and put the date and URL in a header comment.
 
-**Key tests:** `test_cost_sums_four_token_kinds`, `test_unknown_model_gives_none_and_lists_model`, `test_user_override_wins`, `test_decimal_no_float_drift`.
+**Key tests:** `test_cost_sums_five_token_kinds`, `test_cost_state_line_shown_as_claude_code_estimate`, `test_unknown_model_gives_none_and_lists_model`, `test_user_override_wins`, `test_decimal_no_float_drift`.
 
 ### Task 2.4: Alerts panel, usage panel, session switcher, diagnostics footer
 **Files:** `ui/widgets/{alerts,usage,sessions}.py`, `ui/presenters.py`, `tests/ui/*`
@@ -586,19 +591,21 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 - `DeliveryOutcome = Typed | Declined(reason)`
 - It records `last_reference` in the store for the TUI.
 
-**Key tests:** `test_permission_prompt_falls_back_to_clipboard`, `test_uses_session_bound_to_target_pane`, `test_label_selector_page_view_never_typed`, `test_all_typers_decline_returns_shown`.
+**Key tests:** `test_permission_request_falls_back_to_clipboard`, `test_uses_session_bound_to_target_pane`, `test_label_selector_page_view_never_typed`, `test_all_typers_decline_returns_shown`.
 
 ### Task 3.5: tmux typer, pane inspector, dialog signatures
 **Files:** `adapters/tmux.py`, `adapters/tmux_dialogs.py`, `tests/adapters/test_tmux.py`, `tests/integration/test_tmux_real.py`, `tests/integration/byte_recorder.py`
 **Interfaces:**
-- `TmuxPromptTyper(pane: PaneId, run: AsyncRunner, inspector: PaneInspector, dialogs: Sequence[DialogSignature])`
+- `TmuxPromptTyper(pane: PaneId, run: AsyncRunner, inspector: PaneInspector, dialogs: Sequence[DialogSignature], new_buffer_name: Callable[[], str])`, which delivers through `load-buffer` and `paste-buffer -p -d`
 - `PaneStatus(in_mode: bool, command: str, screen: str)`
-- `DialogSignature(name: str, all_of: tuple[str, ...])`, built from the Spike 0b screens
+- `DialogSignature(name: str, pattern: re.Pattern[str], bottom_lines: int)`. The defaults are `esc_to_cancel` (`Esc to cancel`, bottom 15) and `numbered_menu` (`^\s*❯ \d+\. `), tested against every file in `tests/fixtures/screens/`
 
 **Key tests:**
 - all the S8 tests, plus the tmux S9 tests named in spec §9
 - `test_declines_when_pane_gone`
 - `test_declines_when_command_not_claude_or_node`
+- `test_stale_flag_cleared_when_screen_shows_no_dialog_after_1_5s`
+- `test_signatures_match_only_dialog_screens`: `permission_prompt.txt` and `trust_dialog.txt` match; idle, working, at_autocomplete, slash_menu and after_esc don't
 - `@pytest.mark.integration test_text_arrives_without_newline`
 - `test_capture_pane_dialog_detected`
 
@@ -627,6 +634,7 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 **Files:** `cli.py` (`up`, `init --next` snippet text in `adapters/snippets.py`), `examples/next-demo/src/app/kingkai-overlay.tsx` (the snippet applied to the demo), `tests/e2e/test_next_click.py`, CI job `e2e`
 **Key tests:**
 - `test_up_creates_session_with_two_panes_and_records_claude_pane`, run against a fake `AsyncRunner` with the argv asserted
+- `test_up_strips_parent_claude_code_env_vars`
 - `test_next_snippet_reads_session_file_per_request_and_renders_nothing_when_stale`
 - e2e: `test_alt_click_types_reference_bytes`
 - e2e: `test_foreign_origin_page_gets_403`

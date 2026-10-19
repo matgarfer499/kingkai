@@ -1,0 +1,33 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000005",
+  "permission_mode": "default",
+  "agent_id": "adf7bd5ddbd85bae7",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001/subagents/agent-adf7bd5ddbd85bae7.jsonl",
+  "last_assistant_message": "Here are lines 1–5 of `/home/user/dev/demo/src/big.ts`, exactly as they appear:\n\n```\nexport const v1 = 1; // line 1\nexport const v2 = 2; // line 2\nexport const v3 = 3; // line 3\nexport const v4 = 4; // line 4\nexport const v5 = 5; // line 5\n```",
+  "background_tasks": [
+    {
+      "id": "adf7bd5ddbd85bae7",
+      "type": "subagent",
+      "status": "running",
+      "description": "Read lines 1-5 of big.ts",
+      "agent_type": "general-purpose"
+    },
+    {
+      "id": "a9d8e861a6279819b",
+      "type": "subagent",
+      "status": "running",
+      "description": "List files under app/",
+      "agent_type": "general-purpose"
+    }
+  ],
+  "session_crons": []
+}

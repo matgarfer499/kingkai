@@ -1,0 +1,45 @@
+  one hundred twelve
+  one hundred thirteen
+  one hundred fourteen
+  one hundred fifteen
+  one hundred sixteen
+  one hundred seventeen
+  one hundred eighteen
+  one hundred nineteen
+  one hundred twenty
+  one hundred twenty-one
+  one hundred twenty-two
+  one hundred twenty-three
+  one hundred twenty-four
+  one hundred twenty-five
+  one hundred twenty-six
+  one hundred twenty-seven
+  one hundred twenty-eight
+  one hundred twenty-nine
+  one hundred thirty
+  one hundred thirty-one
+  one hundred thirty-two
+  one hundred thirty-three
+  one hundred thirty-four
+  one hundred thirty-five
+  one hundred thirty-six
+  one hundred thirty-seven
+  one hundred thirty-eight
+  one hundred thirty-nine
+  one hundred forty
+  one hundred forty-one
+  one hundred forty-two
+  one hundred forty-three
+  one hundred forty-four
+  one hundred forty-five
+  one hundred forty-six
+  one hundred forty-seven
+
+  ❯ /craft-prompt                                                Convierte una petición tuya (vaga o detallada) en un prompt impecable en inglés para Claude Code, con modelo, effort y ultracode
+                                                                 recomendados. Aplica además las prácticas oficiales de prompting del modelo destino (Fable 5/5.1/Mythos 5, Opus 5.5, Opus 5 o Sonnet…
+    /superpowers:brainstorming                                   (superpowers) You MUST use this before any creative work - creating features, building components, adding functionality, modifying
+                                                                 behavior, or planning anything new, in software or out of it (a talk, a business, a renovation).
+    /superpowers:writing-plans                                   (superpowers) Use when you have a spec or requirements for a multi-step task, before touching code
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,18 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000006",
+  "permission_mode": "default",
+  "agent_id": "a8bef0a84f73ffe6c",
+  "agent_type": "",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001/subagents/agent-a8bef0a84f73ffe6c.jsonl",
+  "last_assistant_message": "@src/big.ts:140 quote that line exactly, no tools.",
+  "background_tasks": [],
+  "session_crons": []
+}

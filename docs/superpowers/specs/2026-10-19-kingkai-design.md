@@ -20,7 +20,7 @@ kingkai is a terminal sidekick for Claude Code. It does two things.
    - alerts when the agent looks stuck: the same tool with the same arguments N times, tool errors, retry loops, long silences;
    - tokens and estimated cost for the session;
    - the last reference that was clicked.
-2. **Click-to-reference.** Alt+click an element in the local dev app (Next.js/React 19 or Django templates). The source location of that element, for example `@src/components/Button.tsx#L42 `, is **typed** into the Claude Code prompt through `tmux send-keys`. kingkai never presses Enter. Outside tmux, the reference goes to the clipboard instead.
+2. **Click-to-reference.** Alt+click an element in the local dev app (Next.js/React 19 or Django templates). The source location of that element, for example `@src/components/Button.tsx#L42 `, is **typed** into the Claude Code prompt as a tmux bracketed paste (`paste-buffer -p`). kingkai never presses Enter. Outside tmux, the reference goes to the clipboard instead.
 
 kingkai uses no local AI and makes no network calls beyond 127.0.0.1.
 
@@ -64,7 +64,7 @@ kingkai uses no local AI and makes no network calls beyond 127.0.0.1.
  ┌──────────── tmux session "kingkai-<project>" ─────────────────────────────┐
  │ pane %L: claude                       pane %R: kingkai (Textual TUI)      │
  └──────┬──────────────────────────────────────────▲─────────────────────────┘
-        │ hook (async, command)                     │ tmux send-keys -l (Reference only)
+        │ hook (async, command)                     │ tmux paste-buffer -p (Reference only)
         ▼                                           │
  kingkai-hook (stdlib only) ──append──▶ spool/<session>.ndjson
                                             │ tail
@@ -248,13 +248,14 @@ All hooks go in `.claude/settings.local.json`, each with a type `command` handle
 | `PreToolUse` | Tool call started | `tool_name`, `tool_input`, `tool_use_id`, `agent_id?`, `agent_type?` |
 | `PostToolUse` | Tool call succeeded | the same as above, plus `duration_ms?` (`tool_response` is shrunk, §5.1) |
 | `PostToolUseFailure` | Tool call failed | the same as above, plus `error`, `is_interrupt?` |
-| `SubagentStart` / `SubagentStop` | Subagent tree | `agent_id`, `agent_type`, `agent_transcript_path` (on Stop) |
-| `Notification` | `permission_prompt` / `idle_prompt` mark the prompt as **not safe to type into** | `notification_type`, `message` |
+| `SubagentStart` / `SubagentStop` | Subagent tree. A `SubagentStop` with no `agent_type` for an agent never seen before is an internal auxiliary agent (for example the prompt-suggestion agent) and is ignored. | `agent_id`, `agent_type`, `agent_transcript_path` (on Stop) |
+| `PermissionRequest` | **The dialog signal.** It fires as the permission dialog opens (Spike 0b). It marks the prompt as **not safe to type into**. Our hook never returns a decision. | `tool_name`, `agent_id?` |
+| `Notification` | Informational only. Spike 0b showed it is unreliable for dialogs: it fired for 1 of 3. | `notification_type`, `message` |
 | `Stop` | Closes the turn | `stop_hook_active` |
 | `PreCompact` | Shows compaction on the timeline | `trigger` |
 | `SessionEnd` | Closes the session | `reason` |
 
-- **Attribution.** A payload with `agent_id` belongs to that subagent; without it, it belongs to the main agent. This follows the hooks docs: "the input carries the agent_id and agent_type common input fields that identify the subagent". The docs hedge here, so Phase 0 confirms it with a real run.
+- **Attribution.** A payload with `agent_id` belongs to that subagent; without it, it belongs to the main agent. This follows the hooks docs, and Spike 0b confirmed it (Q7).
 - **`async: true`.** The hook never blocks Claude, and Claude Code doesn't enforce a timeout on async hooks. The `timeout: 5` is there in case async stops being honoured.
 - **`SessionEnd`.** It has a 1.5 s default timeout. Appending to the spool takes milliseconds, so that is fine.
 
@@ -269,12 +270,12 @@ Order is the order in which the service applies events: spool line order within 
 
 ```
 SessionStarted(transcript_path, cwd, source, model, tmux_pane)   # tmux_pane from _kk.pane
-TurnStarted(prompt_preview)            TurnStopped()
+TurnStarted(kind, prompt_preview)      TurnStopped()   # kind: user | system ("<task-notification>" prompts)
 ToolCallStarted(agent, tool_use_id, tool, input_fingerprint, touches)
 ToolCallSucceeded(agent, tool_use_id, duration_ms)
 ToolCallFailed(agent, tool_use_id, error_summary, interrupted)
 SubagentStarted(agent_id, agent_type)  SubagentStopped(agent_id, transcript_path)
-AttentionRequested(agent, kind)  # permission_prompt | idle_prompt | other
+AttentionRequested(agent, tool)  # from PermissionRequest
 Compacted(trigger)        SessionEnded(reason)
 UsageRecorded(agent, message_id, model, usage: TokenUsage)   # from the transcript
 Tick(session_id, now)     # synthetic, one per active session per second; never stored
@@ -295,9 +296,11 @@ Tick(session_id, now)     # synthetic, one per active session per second; never 
 - **Unknown agent.** A `ToolCallStarted` for an `agent_id` with no `SubagentStarted` creates the node implicitly, with `agent_type="unknown"`.
 - **Turn and typeability.**
   - `TurnStarted` → `turn_open = True`. `TurnStopped` → `turn_open = False`.
-  - `AttentionRequested(agent, permission_prompt)` adds `agent` to `awaiting_permission: frozenset[AgentRef]`.
+  - `AttentionRequested(agent, tool)` adds `agent` to `awaiting_permission: frozenset[AgentRef]`, and records when it happened.
   - Only events from **that same agent** remove it: its next `ToolCallStarted`, `Succeeded` or `Failed`. A `TurnStopped` or `TurnStarted` clears the whole set. A parallel subagent's activity never clears the main agent's dialog flag.
-  - `idle_prompt` doesn't block typing: it means Claude is waiting for input, which is exactly when a reference is useful.
+  - `Notification` (including `idle_prompt`) never blocks typing.
+  - A cancelled dialog (Esc) emits **no** event (Spike 0b). The flag would otherwise stay set until the next prompt, so §8.4 layer 3 can override a flag that is more than 1.5 s old once the screen shows no dialog.
+- **Abandoned calls.** A denied or cancelled tool call gets no `Succeeded` or `Failed`. On the next `TurnStarted`, and at `SessionEnded`, every call still `running` for that agent becomes `abandoned`.
   - The reducer's flag is only **one of the layers** for S9. Hooks are async and polled, so it can lag. See §8.4 for the pane check done just before typing, and §16 Q-S9 for the residual risk.
 
 ### 4.4 Alert detectors (Strategy)
@@ -320,12 +323,13 @@ The plan's verification criterion ("the same command failing 3 times raises an a
 - **Where usage comes from.** `UsageRecorded` events come only from the transcript, because hooks carry no token data. The tailer reads only `type == "assistant"` lines that have `message.usage`. It keeps `message.id`, `message.model`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`.
 - **Dedupe.** A streamed message may repeat its usage across several lines. The reducer keeps the **last** usage per `message_id`. Usage is keyed by `message_id` across *all* files of a session, so if a subagent's usage also shows up in the main transcript, it is counted once.
 
-  > **Decision (my call):** keep the last usage, not the sum. Phase 1 confirms with fixtures whether repeated usage is cumulative or per chunk.
-- **Subagent usage.** Read from the `agent_transcript_path` that `SubagentStop` reports. While a subagent is still running, the tailer also watches `<session>/subagents/agent-*.jsonl`. The `agent-<id>` file name maps to the `agent_id`; Phase 1 verifies that mapping.
+  Spike 0b confirmed that repeated usage is **cumulative**, so the last value wins. It also confirmed that subagent usage appears only in the subagent's own file.
+- **Subagent usage.** Read from the `agent_transcript_path` that `SubagentStop` reports. While a subagent is still running, the tailer also watches `<session>/subagents/agent-*.jsonl`. The file name is `agent-<agent_id>.jsonl` (confirmed). Auxiliary agents have no transcript, so their usage (small amounts, e.g. Haiku) is not counted, and the UI help says so.
 - **Cost.**
-  - The estimate is `Σ tokens × price` from `assets/pricing.toml` (USD per million tokens, for each model and each of the 4 token kinds). Users can override it in `kingkai.toml`.
+  - The estimate is `Σ tokens × price` from `assets/pricing.toml` (USD per million tokens, for each model and each of 5 token kinds: input, output, cache write 5 m, cache write 1 h, cache read). Cache writes are split using `usage.cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.. Users can override it in `kingkai.toml`.
   - The UI always labels it **"≈ API-equivalent"**. It isn't a bill: subscription plans aren't billed per token.
   - If the model has no price, tokens are shown and cost shows `—`. kingkai never guesses a price.
+  - **Claude Code's own figure.** When the transcript has a `cost-state` line (internal format; written near the end of a session), kingkai shows its `totalCostUSD` beside the estimate as "Claude Code's estimate". It is optional: parsing failures are ignored.
 - **OpenTelemetry.** Claude Code's OTel export is a documented alternative that includes `cost_usd` and `query_source`. It is out of scope for the MVP (§14): it only works for sessions started with OTel env vars, and it would need an OTLP receiver. The `EventSource` port leaves room for it.
 
 ---
@@ -547,20 +551,29 @@ The whole-string regex is `^@(?:[\w.\-()\[\]@+]+/)*[\w.\-()\[\]@+]+(?:#L|:)[1-9]
 
 > **Decision (my call):** paths containing spaces are rejected in the MVP. Spike 0b checks whether Claude Code accepts a quoted mention.
 
-**Delivery via tmux.** The exact invocation is `asyncio.create_subprocess_exec("tmux", "send-keys", "-t", pane_id, "-l", "--", text)`:
-- there is no shell;
-- `-l` turns off key-name lookup;
-- `--` ends option parsing;
-- `text` always ends in a space, so the argument never ends in `;` (tmux would treat a trailing `;` as a command separator).
+**Delivery via tmux: bracketed paste** (decided by Spike 0b for policy (a)). It runs two commands, both through `asyncio.create_subprocess_exec`, with no shell:
+1. `("tmux", "load-buffer", "-b", buf, "-")`, with `text` written to stdin;
+2. `("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", pane_id)`.
+
+- `buf` is `kingkai-<uuid4 hex>`, unique for each delivery.
+- `-p` wraps the text in bracketed-paste markers, so Claude Code receives a single paste event, and dialog digit hotkeys can't fire. Spike 0b showed that split `send-keys` keystrokes *can* fire them.
+- `-d` deletes the buffer afterwards.
+- tmux never parses the text for key names or `;`.
+- **Residual risk:** tmux 3.4 can't report whether the pane enabled bracketed paste. Layers 1–3 below still apply.
 
 **Which session a pane belongs to.** The hook client records `$TMUX_PANE` in every payload (`_kk.pane`). `ReferenceService` checks typeability against the **newest session whose `tmux_pane` equals the target pane**. If no session is bound to the pane yet (Claude has just started), only the pane checks below apply.
 
 **Checks just before typing.** These are layered and all must pass; otherwise the tmux typer declines and the next typer in the fallback order is tried.
 1. The domain flag: no agent of the bound session is in `awaiting_permission` (§4.3).
 2. `tmux display-message -p -t <pane> '#{pane_id} #{pane_in_mode} #{pane_current_command}'`. The pane must exist, must not be in copy mode, and its command must be `claude` or `node`.
-3. **Dialog detection on screen.** `tmux capture-pane -p -t <pane>` shows the visible screen, which must not match any of the dialog signatures Spike 0b records (for example the permission prompt's option list). The signatures live in `adapters/tmux_dialogs.py` as data with fixture screens, so a Claude Code UI change shows up in tests.
+3. **Dialog detection on screen.** `tmux capture-pane -p -t <pane>` shows the visible screen, which must not match a dialog signature.
+   - The primary signature is `Esc to cancel` within the bottom 15 lines. It matched the permission and folder-trust dialogs, and none of the idle, working, `@`, `/` or after-Esc screens.
+   - The secondary signature is a line matching `^\s*❯ \d+\. ` (a numbered menu cursor).
+   - The signatures live in `adapters/tmux_dialogs.py` as data and are tested against `tests/fixtures/screens/`.
+   - **Layer 1 override:** if the dialog flag is more than 1.5 s old and the screen shows no dialog, the flag is treated as stale (a cancelled dialog) and cleared.
+   - The screen is never used to infer prompt contents: the grey prompt suggestion looks like real text in `capture-pane -p`.
 
-Spike 0b also checks whether `send-keys -l` or bracketed paste (`load-buffer` plus `paste-buffer -p`) is safer against dialog hotkeys. The answer may change the typing primitive (§16 Q-S9).
+**Clean environment.** `kingkai up` starts the Claude pane with the parent's Claude Code session variables removed: `CLAUDECODE`, `CLAUDE_CODE_*` and `CLAUDE_PID`. They leak into child processes otherwise (Spike 0b).
 
 **Fallback.** The clipboard comes next. If no clipboard works, the TUI shows the text in a selectable widget.
 
@@ -571,13 +584,13 @@ Spike 0b also checks whether `send-keys -l` or bracketed paste (`load-buffer` pl
 | Wayland | `wl-copy` | Do not wait on piped stdout: it forks |
 | X11 | `xclip -selection clipboard` | |
 
-**Spike 0b must answer these:**
-1. Does `@path#L42 ` or `@path:42 ` show up as a file mention in the prompt, and does the line actually reach the model?
-2. Does the `@` autocomplete menu open while kingkai types, does it alter the typed text, and does the trailing space close it?
-3. Do `()` and `[]` in paths work?
-4. If the user has already typed text and the cursor is in the middle, is the text inserted at the cursor?
-5. What happens when kingkai types (a) while Claude is working, (b) while a permission dialog is open, and (c) while `/` or another menu is open?
-6. Does `pane_current_command` show `claude` for the native binary and `node` for the npm install?
+**Spike 0b answers** (`docs/spikes/0b-tmux-typing.md`):
+- `#L` resolves and the model receives exactly that line; `:` doesn't resolve.
+- The `@` menu closes on the trailing space, and the text is left unchanged.
+- The reference is inserted at the cursor.
+- While Claude is working, the text stays in the prompt and isn't submitted.
+- `()` and `[]` paths work.
+- `pane_current_command` is `claude` for the native install.
 
 ---
 
@@ -597,7 +610,7 @@ kingkai is a process that types into a terminal running an agent with tool acces
 | S5 | **Normalize the path** | Normalized to POSIX, relative to the root. `.` and `..` segments, empty segments and backslashes are rejected. `file://` and the spike-chosen prefixes are stripped through a closed list. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected`, `::test_backslash_rejected` |
 | S6 | **No newlines or control characters** | Any char of Unicode category `Cc`, `Cf`, `Zl` or `Zp` in a `source.*` field causes a **rejection**. The same chars are **stripped** from display-only fields. The rendered text must match the grammar regex (§8.4). | `test_reference.py::test_rejects_control_chars` (parametrized over `\n \r \t \x00 \x1b   ‮ ​`). `::test_render_matches_grammar`†. `::test_render_never_contains_cr_lf_esc`†. `tests/adapters/http/test_payload.py::test_display_fields_stripped_not_rejected`. |
 | S7 | **No free text, only `@path<sep>line `** | Typing goes through `PromptTyper.type_reference(ref: Reference)`, which takes no `str` (mypy enforces this). `Reference` can only be minted through `parse_reference`: `__post_init__` checks for the private `_MINT` sentinel, and ruff `PLC2701` bans importing private names. `Reference.render()` checks the grammar regex again, and every typer (tmux and clipboard) types only `render()` output. `label`, `selector`, `page` and `view` are display-only. | `tests/domain/test_reference.py::test_direct_construction_raises`, `::test_render_rechecks_grammar`. `tests/application/test_reference_service.py::test_label_selector_page_view_never_typed`. `tests/adapters/test_clipboard.py::test_copies_only_rendered_reference`. mypy `--strict` and ruff in CI. |
-| S8 | **Never send Enter** | The argv is fixed to `send-keys -t <pane> -l -- <text>`. No code path sends key names. `-l` is always present. | `test_tmux.py::test_argv_exact`, and `::test_argv_shape_is_positional`†: for any Reference, the argv is exactly `["tmux","send-keys","-t",pane,"-l","--",text]`, `-l` comes before `--`, and nothing follows `text`. A path segment named `Enter` is still literal text, because of `-l`. Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline` (a real tmux server on a private `-L` socket; the pane runs a byte recorder; the test asserts the exact bytes received and that there is no `\r` or `\n`). |
+| S8 | **Never send Enter** | The only commands are `load-buffer -b <buf> -` (text on stdin) and `paste-buffer -p -d -b <buf> -t <pane>`. No code path runs `send-keys`, so no key names are ever sent. The text never contains CR or LF (S6). | `test_tmux.py::test_commands_exact`, and `::test_never_invokes_send_keys`†: for any Reference, exactly two commands run, `["tmux","load-buffer","-b",buf,"-"]` with `stdin == text`, then `["tmux","paste-buffer","-p","-d","-b",buf,"-t",pane]`, and no argv contains `send-keys`. Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline`. It uses a real tmux server on a private `-L` socket; the pane runs a byte recorder that turns bracketed paste on. The test asserts the exact bytes received, `ESC[200~` + text + `ESC[201~`, and that there is no `\r` or `\n`. |
 | S9 | *new*: **Never type into a dialog** | Three layers (§8.4), and every one must pass: (1) the agent-scoped `awaiting_permission` flag of the session bound to the pane; (2) the pane is not in copy mode and is running `claude` or `node`; (3) `capture-pane` matches no recorded dialog signature. If any layer fails, the reference goes to the clipboard. The residual risk is in §16 Q-S9. | `test_reference_service.py::test_permission_prompt_falls_back_to_clipboard`, `::test_uses_session_bound_to_target_pane`. `tests/domain/test_reducer.py::test_subagent_activity_does_not_clear_main_dialog_flag`, `::test_late_notification_after_tool_start_still_blocks`, `::test_idle_prompt_does_not_block`. `test_tmux.py::test_declines_when_pane_in_mode`, `::test_declines_when_dialog_signature_on_screen` (fixture screens from Spike 0b). Integration: `test_tmux_real.py::test_capture_pane_dialog_detected`. |
 | S10 | *new*: **Hook client can't harm the session** | It always exits 0 with empty stdout and stderr, uses the stdlib only, and validates `session_id` before using it in a path. The spool has mode 0600 inside a 0700 directory. | `tests/hook_client/test_main.py::test_exit_zero_on_garbage`, `::test_no_output_ever`, `::test_bad_session_id_dropped`, `::test_spool_modes`. import-linter contract `hook-client-stdlib-only`. |
 | S11 | *new*: **Rate limit** | At most 5 references per second. Excess requests get 429. This stops a buggy overlay from flooding the prompt. | `test_guards.py::test_rate_limit_429` (with an injected clock) |
@@ -726,12 +739,12 @@ Versions were checked on PyPI, npm and the GitHub releases on 2026-10-19.
 |---|---|---|---|
 | Q1 | React source method: A (build-time) vs B (runtime) vs A then B | Spike 0a | A, falling back to B |
 | Q2 | The path form each method produces | Spike 0a | Normalize `file://` and absolute paths only |
-| Q3 | `#L` vs `:` as the separator (does the mention resolve, and does the line reach the model?) | Spike 0b | `#L` |
-| Q4 | `@` autocomplete interaction, typing mid-text, typing during a turn or a dialog | Spike 0b | Block typing only during permission prompts (S9) |
-| Q5 | Do `()` and `[]` paths work in mentions? | Spike 0b | Allowed |
-| Q6 | `pane_current_command` values for the native binary and the npm install | Spike 0b | Accept `claude` and `node` |
-| Q7 | `agent_id` on subagent tool events; subagent transcript file naming | Phase 1, recorded fixtures | Follow the docs |
-| Q8 | Is usage repeated across streamed lines cumulative? Does subagent usage also appear in the main transcript? Do the 5-minute and 1-hour cache-write tiers need separate prices (`usage.cache_creation`)? | Phase 1, recorded fixtures | Last usage per `message.id`, deduped across files; a single cache-write price |
+| Q3 | `#L` vs `:` as the separator | **Resolved (0b):** `#L` | — |
+| Q4 | `@` autocomplete, typing mid-text, during a turn, in a dialog | **Resolved (0b):** safe at the prompt. Dialogs need bracketed paste and the layers in §8.4. | — |
+| Q5 | `()` and `[]` in mentions | **Resolved (0b):** they work | — |
+| Q6 | `pane_current_command` | **Resolved (0b):** `claude` (native); `node` still accepted | — |
+| Q7 | `agent_id` on subagent tool events; transcript naming | **Resolved (0b):** confirmed; `subagents/agent-<agent_id>.jsonl` | — |
+| Q8 | Is usage cumulative across streamed lines? Is subagent usage duplicated? Cache-write tiers? | **Resolved (0b):** cumulative, so last wins; not duplicated; two tiers (5 m and 1 h), priced separately | — |
 | Q9 | Django: rewrite in `get_contents` or patch the nodelist; include/extends; debug toolbar | Phase 3 spike | Rewrite in `get_contents` |
 
 ---

@@ -1,0 +1,20 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-demo/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/home/user/dev/demo",
+  "prompt_id": "00000000-0000-4000-8000-000000000004",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "ls does-not-exist-dir",
+    "description": "List a directory that doesn't exist (run 1)"
+  },
+  "tool_use_id": "toolu_01NeC3co2yB2wc4dWLGyi4LG",
+  "error": "Exit code 2\nls: cannot access 'does-not-exist-dir': No such file or directory",
+  "is_interrupt": false,
+  "duration_ms": 49
+}
