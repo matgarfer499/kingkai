@@ -111,9 +111,10 @@ src/kingkai/
       repeated_call.py, tool_failure.py, stall.py
     usage.py          TokenUsage, Pricing, CostEstimate
     reference.py      ProjectRoot, ProjectPath, LineNumber, Reference, ReferenceFormat,
-                      RejectionReason, parse_reference(), render()
+                      RejectionReason, parse_reference(), render(), and the
+                      SourceFiles/ResolvedFile Protocols it needs (a domain-owned port)
   application/
-    ports.py          Clock, EventSource, PromptTyper, Clipboard, SourceFiles, Snapshots
+    ports.py          Clock, EventSource, PromptTyper, Clipboard, PaneInspector
     store.py          Store: holds SessionState per session, notifies subscribers
     session_service.py
     reference_service.py
@@ -159,7 +160,10 @@ Each pattern below solves a specific problem in this codebase. Patterns we delib
 1. **Ports and adapters, with `typing.Protocol`.** Claude Code's formats are undocumented or move fast, and tmux, the clipboard and the filesystem are side effects. Protocols in `application/ports.py` let the use cases run in tests against in-memory fakes, with no mocks and no monkeypatching. They are structural, so adapters don't inherit from anything.
 2. **Functional core, imperative shell.** All decisions (state transitions, alerts, reference validation, cost) are pure functions in `domain`. The shell only moves bytes. Most tests are then plain function calls with table-driven inputs.
 3. **State as a fold over events (light event sourcing).** `SessionState = reduce(reduce(initial, e1), e2) …`. Spool replay after a restart is the same code path as live updates. Out-of-order async hooks are handled in a single place, the reducer, and property tests can check order independence (§11). There is no event store beyond the spool file and no snapshots: sessions are small.
-4. **Parse, don't validate (value objects).** A `Reference` can only be built by `parse_reference()`. Once you hold one, it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects any call that tries to type free text (security rule S7).
+4. **Parse, don't validate (value objects).** A `Reference` comes from `parse_reference()`. Once you hold one, it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects any call that tries to type free text. Python can't truly make a constructor private, so three layers back this up (S7):
+   - `Reference.__post_init__` raises unless it receives the module-private capability sentinel `_MINT`, so a direct `Reference(...)` call fails at runtime.
+   - ruff `PLC2701` flags any import of a private name.
+   - `Reference.render()` checks the result against the grammar regex again before returning, and every typer goes through `render()`, the clipboard as well as tmux.
 5. **Anti-corruption layer.** `adapters/hooks` and `adapters/transcript` are the **only** modules that know Claude Code's field names. When a Claude Code release changes them, the fix stays in one place, and the fixture tests (§11.2) catch the drift.
 6. **Strategy, for detectors.** Each alert rule is a small object that satisfies `Detector`. `SessionService` gets a tuple of them. A new rule means a new file and one line in `bootstrap.py`.
 7. **Composition root and constructor injection.** `bootstrap.build_app()` is the only place that builds concrete adapters. There is no DI container: about ten objects can be wired by hand in one readable function.
@@ -182,11 +186,16 @@ class PromptTyper(Protocol):
     name: str                                   # "tmux", "clipboard"
     async def type_reference(self, ref: Reference) -> DeliveryOutcome: ...
 
-class SourceFiles(Protocol):                    # read-only view used by validation
-    def resolve(self, root: ProjectRoot, raw: str) -> ResolvedFile | None: ...
-    def line_count(self, f: ResolvedFile) -> int: ...
+class PaneInspector(Protocol):                  # tmux adapter implements it; fakes in tests
+    async def inspect(self, pane: PaneId) -> PaneStatus | None: ...   # None = pane gone
 
 # domain/reference.py
+class SourceFiles(Protocol):                    # domain-owned port; read-only
+    def resolve(self, root: ProjectRoot, raw: str) -> ResolvedFile | None: ...  # realpath
+    def line_count(self, f: ResolvedFile) -> int: ...
+# parse_reference also re-checks ResolvedFile.real_path.is_relative_to(root.real_path),
+# so a buggy SourceFiles adapter can't widen the boundary.
+
 class ReferenceFormat(StrEnum):
     HASH_L = "#L"                               # default, pending Spike 0b
     COLON = ":"
@@ -212,12 +221,20 @@ def reduce(state: SessionState, event: DomainEvent) -> SessionState: ...
 
 ### 4.1 Hook events we install
 
-All hooks go in `.claude/settings.local.json`, each with a type `command` handler. `kingkai init` writes them and `kingkai uninstall` removes them. Both commands are idempotent. Every entry kingkai writes is identified by its command path ending in `kingkai-hook`, so user hooks are left alone.
+All hooks go in `.claude/settings.local.json`, each with a type `command` handler. `kingkai init` writes them and `kingkai uninstall` removes them. Both commands are idempotent. Every entry kingkai writes is identified by its command path, which is the shim below, so user hooks are left alone.
+- `init` runs `git check-ignore .claude/settings.local.json`. If the file isn't ignored, `init` offers to add it to `.git/info/exclude`. That file is local and never committed, so the user's `.gitignore` is not touched.
+- **A stable shim, so reinstalling can't break hooks.** The hook command is `~/.local/state/kingkai/bin/kingkai-hook`, a POSIX `sh` script written by `init`:
+
+  ```sh
+  PY="/abs/venv/bin/python"; [ -x "$PY" ] || exit 0; exec "$PY" -I -m kingkai.hook_client
+  ```
+
+  If kingkai is uninstalled or its venv moves, the hook still exits 0 silently. `init` rewrites the shim, and `doctor` checks that it points at a working interpreter.
 
 ```json
 { "hooks": { "PreToolUse": [ { "hooks": [ {
     "type": "command",
-    "command": "/abs/path/to/kingkai-hook",
+    "command": "/home/<user>/.local/state/kingkai/bin/kingkai-hook",
     "async": true,
     "timeout": 5
 } ] } ] } }
@@ -242,19 +259,24 @@ All hooks go in `.claude/settings.local.json`, each with a type `command` handle
 
 ### 4.2 Domain events
 
-Domain events are frozen, slotted dataclasses. Every one carries `session_id`, `at: datetime` (the time the hook client received it, UTC), and `seq: int` (spool order). Field names belong to kingkai, not to Claude Code.
+Domain events are frozen, slotted dataclasses. Every one carries:
+- `session_id`;
+- `event_id: str`. For hook events this is a UUID4 that the hook client writes into `_kk.id`. For transcript events it is `"<file>:<byte offset>"`.
+- `at: datetime`, in UTC: when the hook client received the payload, or the transcript line's `timestamp`.
+
+Order is the order in which the service applies events: spool line order within one file. Field names belong to kingkai, not to Claude Code.
 
 ```
-SessionStarted(transcript_path, cwd, source, model)
+SessionStarted(transcript_path, cwd, source, model, tmux_pane)   # tmux_pane from _kk.pane
 TurnStarted(prompt_preview)            TurnStopped()
 ToolCallStarted(agent, tool_use_id, tool, input_fingerprint, touches)
 ToolCallSucceeded(agent, tool_use_id, duration_ms)
 ToolCallFailed(agent, tool_use_id, error_summary, interrupted)
 SubagentStarted(agent_id, agent_type)  SubagentStopped(agent_id, transcript_path)
-AttentionRequested(kind)  # permission_prompt | idle_prompt; sets prompt_typeable = False
+AttentionRequested(agent, kind)  # permission_prompt | idle_prompt | other
 Compacted(trigger)        SessionEnded(reason)
 UsageRecorded(agent, message_id, model, usage: TokenUsage)   # from the transcript
-Tick(now)                 # synthetic; drives the time-based detectors
+Tick(session_id, now)     # synthetic, one per active session per second; never stored
 ```
 
 - **`agent`.** `AgentRef = Main | Sub(agent_id)`.
@@ -268,33 +290,34 @@ Tick(now)                 # synthetic; drives the time-based detectors
 ### 4.3 Reducer rules
 
 - **Correlation by `tool_use_id`.** If a `Succeeded` or `Failed` arrives before its `Started` (possible with async hooks), the reducer records a "dangling end". The matching `Started` closes it when it arrives. The final state is the same in either order, and a property test checks this (§11.1).
-- **Idempotency.** An event with a `(session_id, seq)` the reducer has already applied is a no-op. Replay can then overlap with live tailing safely.
+- **Idempotency.** An event whose `event_id` the reducer has already applied is a no-op. The state keeps a bounded set of seen ids (the last 10 000). Replay can then overlap with live tailing safely. `UsageRecorded` is additionally deduped by `message_id` (§4.5).
 - **Unknown agent.** A `ToolCallStarted` for an `agent_id` with no `SubagentStarted` creates the node implicitly, with `agent_type="unknown"`.
 - **Turn and typeability.**
   - `TurnStarted` → `turn_open = True`. `TurnStopped` → `turn_open = False`.
-  - `prompt_typeable = not awaiting_permission`.
-
-    > **Decision (my call):** kingkai types during a running turn too, because Claude Code queues input typed while it works. It blocks typing only during permission prompts. Spike 0b (Q4) confirms this.
-  - `AttentionRequested(permission_prompt)` → `awaiting_permission = True`.
-  - The next `ToolCallStarted`, `Succeeded` or `Failed` event, `TurnStopped`, or `TurnStarted` → `awaiting_permission = False`.
+  - `AttentionRequested(agent, permission_prompt)` adds `agent` to `awaiting_permission: frozenset[AgentRef]`.
+  - Only events from **that same agent** remove it: its next `ToolCallStarted`, `Succeeded` or `Failed`. A `TurnStopped` or `TurnStarted` clears the whole set. A parallel subagent's activity never clears the main agent's dialog flag.
+  - `idle_prompt` doesn't block typing: it means Claude is waiting for input, which is exactly when a reference is useful.
+  - The reducer's flag is only **one of the layers** for S9. Hooks are async and polled, so it can lag. See §8.4 for the pane check done just before typing, and §16 Q-S9 for the residual risk.
 
 ### 4.4 Alert detectors (Strategy)
 
-Each detector is `(state_before, event, now) -> tuple[Alert, ...]`. An alert has a stable `key` so that it is raised once and updated afterwards, never duplicated.
+Each detector is `(state_before, event, now) -> AlertChanges`, which holds the alerts to raise and the keys to clear. An alert has a stable `key` (for example `repeated:<agent>:<fp>`), so it is raised once and then updated, never duplicated. It also **clears** when its condition no longer holds.
+- "Activity" means a **hook event** for that session. `Tick` and `UsageRecorded` don't count.
+- During replay, `now` is the event's own `at`. Time-based detectors stay off until the service emits `ReplayCompleted`, so a restart doesn't raise stale stall alerts.
 
-| Detector | Fires when | Default (`kingkai.toml`) | Severity |
-|---|---|---|---|
-| `RepeatedCall` | The same `(agent, tool, input_fingerprint)` appears ≥ N times among that agent's last K tool calls | N = 3, K = 10 | warning |
-| `ToolFailure` | Any `ToolCallFailed` that isn't an interrupt | n/a | info |
-| `RetryLoop` | ≥ M consecutive failures of the same `(agent, tool)` | M = 3 | error |
-| `Stall` | A turn is open, `awaiting_permission` is false, and nothing has happened for T seconds (checked on `Tick`) | T = 120 s | warning |
+| Detector | Fires when | Clears when | Default (`kingkai.toml`) | Severity |
+|---|---|---|---|---|
+| `RepeatedCall` | The same `(agent, tool, input_fingerprint)` appears ≥ N times among that agent's last K tool calls | That fingerprint is in fewer than N of the last K calls | N = 3, K = 10 | warning |
+| `ToolFailure` | Any `ToolCallFailed` that isn't an interrupt | Expires 60 s later (informational) | n/a | info |
+| `RetryLoop` | ≥ M consecutive failures of the same `(agent, tool)` | The same `(agent, tool)` succeeds | M = 3 | error |
+| `Stall` | A turn is open, no agent is awaiting permission, and there has been no activity for T seconds. While a tool call is in flight, the threshold is T_tool instead (checked on `Tick`). | The next activity | T = 120 s, T_tool = 600 s | warning |
 
 The plan's verification criterion ("the same command failing 3 times raises an alert") is covered by both `RetryLoop` and `RepeatedCall`.
 
 ### 4.5 Usage and cost
 
 - **Where usage comes from.** `UsageRecorded` events come only from the transcript, because hooks carry no token data. The tailer reads only `type == "assistant"` lines that have `message.usage`. It keeps `message.id`, `message.model`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`.
-- **Dedupe.** A streamed message may repeat its usage across several lines. The reducer keeps the **last** usage per `message_id`.
+- **Dedupe.** A streamed message may repeat its usage across several lines. The reducer keeps the **last** usage per `message_id`. Usage is keyed by `message_id` across *all* files of a session, so if a subagent's usage also shows up in the main transcript, it is counted once.
 
   > **Decision (my call):** keep the last usage, not the sum. Phase 1 confirms with fixtures whether repeated usage is cumulative or per chunk.
 - **Subagent usage.** Read from the `agent_transcript_path` that `SubagentStop` reports. While a subagent is still running, the tailer also watches `<session>/subagents/agent-*.jsonl`. The `agent-<id>` file name maps to the `agent_id`; Phase 1 verifies that mapping.
@@ -312,12 +335,13 @@ The plan's verification criterion ("the same command failing 3 times raises an a
 
 The hook client is a separate console script. It imports only the stdlib, and an import-linter contract checks that.
 
-1. It reads all of stdin, with a 1 MiB limit (anything larger is dropped).
+1. It reads all of stdin. There is no size cap, because shrinking happens before anything is written.
 2. It parses the JSON. If that fails, it exits 0.
-3. **Shrink** (`shrink.py`, a pure function):
-   - Any string longer than 512 characters inside `tool_input` or `tool_response` becomes `{"$sha256": <hex>, "$len": <n>}`. This keeps the spool small (a `Read` response can carry a whole file) and keeps fingerprints exact.
-   - `prompt` is cut to 80 characters.
-4. It adds `"_kk": {"v": 1, "at": <iso8601 UTC>}`.
+3. **Shrink** (`shrink.py`, a pure function, applied recursively to the whole payload):
+   - These display fields are **cut** to a preview: `prompt` to 80 characters; `error`, `message` and `last_assistant_message` to 200.
+   - Any other string longer than 512 characters becomes `{"$sha256": <hex>, "$len": <n>}`. This keeps the spool small (a `Read` response can carry a whole file) and keeps fingerprints exact.
+   - Afterwards, every string in the line is ≤ 512 characters.
+4. It adds `"_kk": {"v": 1, "id": <uuid4 hex>, "at": <iso8601 UTC>, "pane": $TMUX_PANE or null}`.
 5. It appends one line to the spool file, under an exclusive `fcntl.flock`, with mode 0600.
 6. It **always exits 0 and never writes to stdout or stderr**. Every exception is caught and dropped.
 
@@ -332,8 +356,9 @@ The hook client is a separate console script. It imports only the stdlib, and an
 - `NdjsonTailer(path, poll_interval, clock)` yields complete lines only. It keeps a partial trailing line until it gets its `\n`. If the file shrinks or its inode changes, the tailer starts again from offset 0.
 - It polls (default 100 ms for spools, 500 ms for transcripts) and uses `asyncio.sleep` with an injected interval, so tests run with zero sleep.
 - **Decision (my call):** polling instead of inotify/watchfiles. There is one less dependency, behaviour is the same on WSL, macOS and Linux, tests are deterministic, and the latency is good enough.
-- On startup, `watch` replays the newest spool of the project from offset 0. Thanks to reducer idempotency (§4.3), replay followed by live tailing is safe.
-- A session is "active" from `SessionStarted` until `SessionEnded`. If several are active, the TUI shows a session switcher, and the newest one is the default.
+- **Discovery.** `SpoolDirectory` scans the project's spool dir every second. It tails every `*.ndjson` modified in the last 24 h, plus any new file that appears, each from offset 0. Each spool also starts a `TranscriptTailer` for the `transcript_path` its `SessionStarted` gives. Thanks to reducer idempotency (§4.3), replay followed by live tailing is safe. Once every file has been read to EOF on startup, the service emits `ReplayCompleted`.
+- **Session liveness.** A session is `live` from `SessionStarted` until `SessionEnded`, or until 30 minutes pass with no activity, when it becomes `idle`. A session that crashed without a `SessionEnd` then shows as idle, not live forever. The switcher lists live sessions first. The default is the newest session bound to `--pane` (§8.4), or else the newest live one.
+- **Project root.** `watch`, `init` and `up` walk up from the cwd to the nearest directory containing `.claude/` or `.git/`. `--root` overrides this. `doctor` warns when the spool's `CLAUDE_PROJECT_DIR`-based key differs from the resolved root.
 
 ### 5.3 Daemon to TUI
 
@@ -360,6 +385,35 @@ Both run in one process and one asyncio loop.
 | `kingkai up` | Creates or attaches the tmux session `kingkai-<dir>`: `claude` on the left, `kingkai watch --pane <%id>` on the right. The Claude pane id is recorded at creation time. |
 | `kingkai watch [--pane %N]` | Starts the TUI and the services. Without `--pane` (outside `up`), references go to the clipboard. |
 | `kingkai doctor` | Checks Python, tmux (≥ 3.2), installed hooks, the spool dir and its permissions, a clipboard backend, and the session file. It explains any failure in one line. |
+
+### 6.1 TUI layout and key bindings
+
+```
+┌ kingkai · myapp · session 3f2a… (live) ───────────────────── ≈ $0.42 · 81k tok ┐
+│ Agents                     │ Timeline                                          │
+│ ▼ main  ● working          │ 10:02:11 main  Read   src/app/page.tsx       12ms │
+│   ├ Explore  ✓ done        │ 10:02:12 sub1  Grep   "useAuth"              40ms │
+│   └ general  ● working     │ 10:02:15 main  Bash   ✗ exit 1               2.1s │
+├────────────────────────────┼───────────────────────────────────────────────────┤
+│ Files                      │ Alerts                                            │
+│ W src/app/page.tsx      2  │ ⚠ RetryLoop  main · Bash failed 3× in a row       │
+│ R src/lib/auth.ts       1  │ ⚠ Stall      no activity for 2m (turn open)       │
+├────────────────────────────┴───────────────────────────────────────────────────┤
+│ Last reference: @src/components/Button.tsx#L42  → typed (tmux %3) · Button      │
+└ s sessions  a agent filter  f files: all/written  c clear alerts  ? help  q quit ┘
+```
+
+| Key | Action |
+|---|---|
+| `s` | Session switcher (modal list) |
+| `a` | Filter the timeline and files by the agent selected in the tree (toggle) |
+| `f` | Files panel: show all touches, or written files only |
+| `c` | Dismiss the current alerts. They come back if their condition fires again. |
+| `y` | Copy the last reference to the clipboard (the manual fallback) |
+| `?` | Help screen |
+| `q` / `ctrl+q` | Quit |
+
+Below 100 columns, the layout collapses to tabs (`1`–`4` switch panels). Snapshot tests cover 120×40 and 80×24.
 
 ---
 
@@ -394,10 +448,14 @@ The browser overlay is TypeScript in `overlay/`. esbuild bundles it into one IIF
 
 ```json
 { "v": 1, "url": "http://127.0.0.1:53817", "token": "<43 chars, secrets.token_urlsafe(32)>",
-  "pid": 4242, "started_at": "2026-10-19T10:00:00Z" }
+  "root": "/home/<user>/dev/myapp", "pid": 4242, "started_at": "2026-10-19T10:00:00Z" }
 ```
 
 The port is ephemeral (bound to `127.0.0.1:0`). That's possible because the integrations read the URL from this file, and it avoids port conflicts.
+
+**Integrations read the session file on each request.** They cache it by mtime and inject **nothing** when the file is missing or its pid is dead. When kingkai restarts, the port and token change. If the overlay's POST fails to connect or gets `403 token`, the overlay shows "kingkai restarted, reload the page".
+
+**Paths.** Integrations send **absolute** file paths. Django's loader writes `origin.name`, and the React method is normalized to absolute in the overlay where possible. Python is the only place paths are made relative, against `root`. That keeps monorepos and Django `BASE_DIR` layouts unambiguous.
 
 **Interaction.**
 - Holding Alt highlights the element under the pointer and shows a label (`Button.tsx:42`).
@@ -424,13 +482,11 @@ Request body (≤ 4 KiB, `Content-Type: application/json`):
 
 - `source.kind` is `react` or `django`.
 - `source.file` may be relative to the project root, absolute, or a `file://` URL. Before validation, the adapter normalizes it with a **closed list** of prefixes: `file://`, plus whatever Spike 0a finds the chosen React method produces.
-- `label`, `selector` and `page` are **only displayed in the TUI**. They are never typed, and before display they are stripped of control characters and cut to 120 characters.
+- `label`, `selector`, `page` and `view` (Django's `kingkai-view` meta, shown next to the reference) are **only displayed in the TUI**. They are never typed, and before display they are **stripped** of control characters and cut to 120 characters. The `source.*` fields are **rejected** if they contain any (S6).
 
 Responses:
-- `202 {"status": "typed" | "copied", "text": "@src/components/Button.tsx#L42 "}`
-- `400` / `403` / `413` / `415` / `422 {"error": "<code>"}`, where `<code>` is a `RejectionReason` or a guard code.
-
-The status is 202 rather than 200 because delivery is asynchronous with respect to the prompt.
+- `200 {"status": "typed" | "copied" | "shown", "text": "@src/components/Button.tsx#L42 "}`. Delivery finishes before the response is sent.
+- `400` / `403` / `413` / `415` / `422` / `429 {"error": "<code>"}`, where `<code>` is a `RejectionReason` or a guard code.
 
 ### 8.2 React 19 / Next.js 16: where the source location comes from (open question → Spike 0a)
 
@@ -477,11 +533,13 @@ React 19 removed `_debugSource` and the `__source` JSX prop (react#28265). The t
 ```
 typed   = "@" path sep line " "
 path    = segment *( "/" segment )          ; relative to the project root, POSIX separators
-segment = 1*( ALNUM-UNICODE / "." / "_" / "-" / "(" / ")" / "[" / "]" / "@" / "+" )
+segment = Python regex [\w.\-()\[\]@+]+ with re.UNICODE \w (letters, digits, "_")
           ; "." and ".." are not allowed as a whole segment
 sep     = "#L" / ":"                        ; ReferenceFormat; chosen once per config
-line    = 1-9 *DIGIT                        ; 1 ≤ line ≤ number of lines in the file
+line    = [1-9][0-9]*                       ; 1 ≤ line ≤ number of lines in the file
 ```
+
+The whole-string regex is `^@(?:[\w.\-()\[\]@+]+/)*[\w.\-()\[\]@+]+(?:#L|:)[1-9][0-9]* $`, plus a check on `.` and `..` segments. The rendered path is the **resolved filesystem name** made relative to the root, so the user can't choose its spelling. It is NFC-normalized before matching against the grammar.
 
 - Next.js app-router paths are allowed (`app/(marketing)/[slug]/page.tsx`).
 - Spaces, `;`, `#`, `:`, quotes, backslashes and every control or format character are rejected.
@@ -494,7 +552,14 @@ line    = 1-9 *DIGIT                        ; 1 ≤ line ≤ number of lines in 
 - `--` ends option parsing;
 - `text` always ends in a space, so the argument never ends in `;` (tmux would treat a trailing `;` as a command separator).
 
-Before typing, the adapter runs `tmux display-message -p -t <pane> '#{pane_id} #{pane_in_mode} #{pane_current_command}'`. If the pane is gone, is in copy mode (`pane_in_mode = 1`), or isn't running `claude` or `node`, it declines and the next typer in the fallback order is tried.
+**Which session a pane belongs to.** The hook client records `$TMUX_PANE` in every payload (`_kk.pane`). `ReferenceService` checks typeability against the **newest session whose `tmux_pane` equals the target pane**. If no session is bound to the pane yet (Claude has just started), only the pane checks below apply.
+
+**Checks just before typing.** These are layered and all must pass; otherwise the tmux typer declines and the next typer in the fallback order is tried.
+1. The domain flag: no agent of the bound session is in `awaiting_permission` (§4.3).
+2. `tmux display-message -p -t <pane> '#{pane_id} #{pane_in_mode} #{pane_current_command}'`. The pane must exist, must not be in copy mode, and its command must be `claude` or `node`.
+3. **Dialog detection on screen.** `tmux capture-pane -p -t <pane>` shows the visible screen, which must not match any of the dialog signatures Spike 0b records (for example the permission prompt's option list). The signatures live in `adapters/tmux_dialogs.py` as data with fixture screens, so a Claude Code UI change shows up in tests.
+
+Spike 0b also checks whether `send-keys -l` or bracketed paste (`load-buffer` plus `paste-buffer -p`) is safer against dialog hotkeys. The answer may change the typing primitive (§16 Q-S9).
 
 **Fallback.** The clipboard comes next. If no clipboard works, the TUI shows the text in a selectable widget.
 
@@ -527,12 +592,12 @@ kingkai is a process that types into a terminal running an agent with tool acces
 | S3a | *new*: **Host check** (DNS rebinding) | `Host` must be `127.0.0.1:<port>` or `localhost:<port>` | `test_guards.py::test_rebinding_host_403` |
 | S3b | *new*: **Force a preflight** | POST requires `Content-Type: application/json`. Otherwise 415, so no "simple" CORS request can get through. | `test_guards.py::test_form_content_type_415`, `::test_text_plain_415` |
 | S3c | *new*: **Body limit** | `client_max_size = 4096` | `test_guards.py::test_oversized_body_413` |
-| S4 | **References only to files that exist inside the project** | `parse_reference` uses `SourceFiles.resolve` (realpath, which follows symlinks) and requires `is_relative_to(realpath(root))`, a regular file, and `1 ≤ line ≤ line_count`. | `tests/domain/test_reference.py::test_dotdot_escape_rejected`, `::test_absolute_outside_root_rejected`, `::test_symlink_escape_rejected`, `::test_directory_rejected`, `::test_missing_file_rejected`, `::test_line_zero_and_past_eof_rejected`. `::test_resolved_path_always_inside_root`† |
+| S4 | **References only to files that exist inside the project** | `parse_reference` uses `SourceFiles.resolve` (realpath, which follows symlinks) and requires `is_relative_to(realpath(root))`, a regular file, and `1 ≤ line ≤ line_count`. | `tests/domain/test_reference.py::test_dotdot_escape_rejected`, `::test_absolute_outside_root_rejected`, `::test_directory_rejected`, `::test_missing_file_rejected`, `::test_line_zero_and_past_eof_rejected`, `::test_resolved_path_always_inside_root`†, `::test_domain_rechecks_containment_against_lying_adapter`. Real filesystem, using `tmp_path` with real symlinks: `tests/adapters/test_source_files.py::test_symlink_escape_rejected`, `::test_symlinked_parent_dir_escape_rejected`, `::test_symlink_inside_root_allowed`. |
 | S5 | **Normalize the path** | Normalized to POSIX, relative to the root. `.` and `..` segments, empty segments and backslashes are rejected. `file://` and the spike-chosen prefixes are stripped through a closed list. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected`, `::test_backslash_rejected` |
-| S6 | **No newlines or control characters** | Every char in every field of the request is checked: Unicode categories `Cc`, `Cf`, `Zl`, `Zp` are rejected. The rendered text must match the grammar regex (§8.4). | `test_reference.py::test_rejects_control_chars` (parametrized over `\n \r \t \x00 \x1b   ‮ ​`). `::test_render_matches_grammar`†. `::test_render_never_contains_cr_lf_esc`† |
-| S7 | **No free text, only `@path<sep>line `** | Typing goes through `PromptTyper.type_reference(ref: Reference)`, which takes no `str` (mypy enforces this). `Reference` can only be built by `parse_reference`. The tmux adapter checks the grammar regex once more before calling exec. `label`, `selector` and `page` are display-only. | `tests/adapters/test_tmux.py::test_refuses_text_not_matching_grammar`. `tests/application/test_reference_service.py::test_label_and_selector_never_typed`. `tests/architecture/test_typing_surface.py::test_prompt_typer_has_no_str_entrypoint` (inspects the Protocol's signatures). mypy `--strict` in CI. |
-| S8 | **Never send Enter** | The argv is fixed to `send-keys -t <pane> -l -- <text>`. No code path sends key names. `-l` is always present. | `test_tmux.py::test_argv_exact`, `::test_argv_never_contains_key_names`† (`Enter`, `C-m`, `C-j`, `KPEnter`). Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline` (a real tmux server on a private `-L` socket; the pane runs a byte recorder; the test asserts the exact bytes received and that there is no `\r` or `\n`). |
-| S9 | *new*: **Never type into a dialog** | Typing is refused while `awaiting_permission` is set (§4.3) or while the pane is in copy mode. The reference then goes to the clipboard. | `test_reference_service.py::test_permission_prompt_falls_back_to_clipboard`. `test_tmux.py::test_declines_when_pane_in_mode`. `tests/domain/test_reducer.py::test_permission_prompt_clears_on_next_tool_event` |
+| S6 | **No newlines or control characters** | Any char of Unicode category `Cc`, `Cf`, `Zl` or `Zp` in a `source.*` field causes a **rejection**. The same chars are **stripped** from display-only fields. The rendered text must match the grammar regex (§8.4). | `test_reference.py::test_rejects_control_chars` (parametrized over `\n \r \t \x00 \x1b   ‮ ​`). `::test_render_matches_grammar`†. `::test_render_never_contains_cr_lf_esc`†. `tests/adapters/http/test_payload.py::test_display_fields_stripped_not_rejected`. |
+| S7 | **No free text, only `@path<sep>line `** | Typing goes through `PromptTyper.type_reference(ref: Reference)`, which takes no `str` (mypy enforces this). `Reference` can only be minted through `parse_reference`: `__post_init__` checks for the private `_MINT` sentinel, and ruff `PLC2701` bans importing private names. `Reference.render()` checks the grammar regex again, and every typer (tmux and clipboard) types only `render()` output. `label`, `selector`, `page` and `view` are display-only. | `tests/domain/test_reference.py::test_direct_construction_raises`, `::test_render_rechecks_grammar`. `tests/application/test_reference_service.py::test_label_selector_page_view_never_typed`. `tests/adapters/test_clipboard.py::test_copies_only_rendered_reference`. mypy `--strict` and ruff in CI. |
+| S8 | **Never send Enter** | The argv is fixed to `send-keys -t <pane> -l -- <text>`. No code path sends key names. `-l` is always present. | `test_tmux.py::test_argv_exact`, and `::test_argv_shape_is_positional`†: for any Reference, the argv is exactly `["tmux","send-keys","-t",pane,"-l","--",text]`, `-l` comes before `--`, and nothing follows `text`. A path segment named `Enter` is still literal text, because of `-l`. Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline` (a real tmux server on a private `-L` socket; the pane runs a byte recorder; the test asserts the exact bytes received and that there is no `\r` or `\n`). |
+| S9 | *new*: **Never type into a dialog** | Three layers (§8.4), and every one must pass: (1) the agent-scoped `awaiting_permission` flag of the session bound to the pane; (2) the pane is not in copy mode and is running `claude` or `node`; (3) `capture-pane` matches no recorded dialog signature. If any layer fails, the reference goes to the clipboard. The residual risk is in §16 Q-S9. | `test_reference_service.py::test_permission_prompt_falls_back_to_clipboard`, `::test_uses_session_bound_to_target_pane`. `tests/domain/test_reducer.py::test_subagent_activity_does_not_clear_main_dialog_flag`, `::test_late_notification_after_tool_start_still_blocks`, `::test_idle_prompt_does_not_block`. `test_tmux.py::test_declines_when_pane_in_mode`, `::test_declines_when_dialog_signature_on_screen` (fixture screens from Spike 0b). Integration: `test_tmux_real.py::test_capture_pane_dialog_detected`. |
 | S10 | *new*: **Hook client can't harm the session** | It always exits 0 with empty stdout and stderr, uses the stdlib only, and validates `session_id` before using it in a path. The spool has mode 0600 inside a 0700 directory. | `tests/hook_client/test_main.py::test_exit_zero_on_garbage`, `::test_no_output_ever`, `::test_bad_session_id_dropped`, `::test_spool_modes`. import-linter contract `hook-client-stdlib-only`. |
 | S11 | *new*: **Rate limit** | At most 5 references per second. Excess requests get 429. This stops a buggy overlay from flooding the prompt. | `test_guards.py::test_rate_limit_429` (with an injected clock) |
 
@@ -574,10 +639,10 @@ There is one test tree, and it mirrors `src/`. The test pyramid weighs heavily t
 
 - **Domain.** The reducer, the detectors, reference parsing and rendering, and usage/cost, all with table-driven `pytest.mark.parametrize`. A `FakeClock` and a `FakeSourceFiles` (an in-memory tree that includes symlink entries) are injected.
 - **Property tests** (hypothesis):
-  - For any permutation of a session's events that keeps each tool call's own events in order, `reduce` gives the same state (out-of-order tolerance).
+  - For any interleaving of the `Started` and `Succeeded`/`Failed` events of a set of tool calls, `reduce` gives the same **per-tool-call state** and the same file touches (out-of-order tolerance). Turn state, dialog flags, alerts and last activity *depend on order by design*, so they get example-based tests instead.
   - Applying an event twice is the same as applying it once (idempotency).
   - For any generated raw path or line, `parse_reference` either rejects it or returns a `Reference` whose rendered text matches the grammar regex and resolves inside the root (S4, S6).
-  - For any payload, `shrink` returns valid JSON whose strings are all ≤ 512 characters, with the same fingerprint for equal inputs.
+  - For any payload, `shrink` returns valid JSON whose strings are all ≤ 512 characters, with the same fingerprint for equal inputs and different fingerprints for different `tool_input`s.
 - **Presenters.** State in, view model out. No Textual involved.
 
 ### 11.2 Contract tests against Claude Code formats
@@ -606,8 +671,7 @@ There is one test tree, and it mirrors `src/`. The test pyramid weighs heavily t
 
 ### 11.6 Architecture tests
 
-- import-linter contracts (§3.2) run in CI.
-- `test_typing_surface.py` (S7).
+- import-linter contracts (§3.2) run in CI: `layers` (ui | adapters → application → domain), `hook-client-stdlib-only` (forbids `kingkai.*` and every third-party package), and `domain-pure` (forbids asyncio, msgspec, textual and aiohttp in `kingkai.domain`).
 
 ### 11.7 Overlay (TypeScript)
 
@@ -630,7 +694,7 @@ Versions were checked on PyPI, npm and the GitHub releases on 2026-10-19.
 | Python | `requires-python = ">=3.12"`; CI on 3.12, 3.13, 3.14, 3.15 | 3.12 is the oldest version with security support that all the dependencies cover (Django 6.1 needs it). It gives us PEP 695 generics and `StrEnum`. |
 | Packaging and env | **uv** 0.13 with the **uv_build** backend, a `src/` layout, `[project.scripts]` (`kingkai`, `kingkai-hook`), and `[dependency-groups]` for dev | One fast tool for locking, venvs, running and building. uv_build needs no config for a pure-Python package. `uv.lock` is committed. |
 | Runtime deps | `textual>=8.2`, `aiohttp>=3.14`, `msgspec>=0.22`, `cyclopts>=5.2`. Extra `django = ["django>=5.2"]` | **aiohttp:** HTTP that runs in Textual's loop without taking over signal handlers. **msgspec:** typed, strict and fast decoding of large JSONL at the boundary, and its Structs are plain classes for mypy. **cyclopts:** a type-hint driven CLI, testable by calling it with argv, and lighter than Typer/Click. |
-| Lint and format | **ruff** 0.17: `ruff format` plus `extend-select` for `ANN, ASYNC, S, TRY, PTH, DTZ, FBT, ARG, ERA, T20, BLE, PL, TC, FURB, RUF, D` (Google docstrings), relaxed for tests | One tool, very fast. `extend-select` keeps 0.16's larger default set. |
+| Lint and format | **ruff** 0.17: `ruff format` plus `extend-select` for `ANN, ASYNC, S, TRY, PTH, DTZ, FBT, ARG, ERA, T20, BLE, PL, TC, FURB, RUF`, relaxed for tests | One tool, very fast. `extend-select` keeps 0.16's larger default set. `PLC2701` backs S7. Pydocstyle (`D`) is left out on purpose: names and types should carry the meaning, and docstrings are written where they explain *why*. Forcing them everywhere produces noise. |
 | Type checking | **mypy** 2.4 `--strict` as the CI gate. **ty** is recommended in the editor but not gated. | mypy is the stable reference for typeshed, and in research it caught a real Textual gotcha (the `tree` property clash). ty is still a 0.0.x beta, so gating CI on it would break builds for no reason. pyright strict was noisy with Textual's generics. |
 | Tests | **pytest 8.4.x (`>=8.4,<9`)**, pytest-asyncio 1.4 (`asyncio_mode = "auto"`), pytest-textual-snapshot 1.1, hypothesis, pytest-cov | `pytest<9` is required because pytest-textual-snapshot pins syrupy 4.8, which caps pytest. Lift the cap when the plugin updates (a Renovate/Dependabot note). |
 | Architecture | **import-linter** 2.15 | Turns the layering in §3.2 into a CI failure instead of a review comment. |
@@ -666,7 +730,7 @@ Versions were checked on PyPI, npm and the GitHub releases on 2026-10-19.
 | Q5 | Do `()` and `[]` paths work in mentions? | Spike 0b | Allowed |
 | Q6 | `pane_current_command` values for the native binary and the npm install | Spike 0b | Accept `claude` and `node` |
 | Q7 | `agent_id` on subagent tool events; subagent transcript file naming | Phase 1, recorded fixtures | Follow the docs |
-| Q8 | Is usage repeated across streamed lines cumulative? | Phase 1, recorded fixtures | Last usage per `message.id` wins |
+| Q8 | Is usage repeated across streamed lines cumulative? Does subagent usage also appear in the main transcript? Do the 5-minute and 1-hour cache-write tiers need separate prices (`usage.cache_creation`)? | Phase 1, recorded fixtures | Last usage per `message.id`, deduped across files; a single cache-write price |
 | Q9 | Django: rewrite in `get_contents` or patch the nodelist; include/extends; debug toolbar | Phase 3 spike | Rewrite in `get_contents` |
 
 ---
@@ -710,3 +774,40 @@ These are my calls. Each one is reversible, and none needs the maintainer's inpu
 10. **Next integration.** A printed snippet instead of an npm package.
 11. **Library choices.** msgspec over pydantic, cyclopts over Typer, aiohttp over starlette/uvicorn, mypy over ty/pyright as the gate.
 12. **Demo apps.** `examples/next-demo` and `examples/django-demo` live in the repo, so that demos and fixtures never touch employer code.
+
+These came out of the builder review (2026-10-19):
+
+13. **Event identity.** The hook client writes a UUID into `_kk.id`, and transcript events use `file:offset`. Usage is deduped by `message_id`. There is no `seq` counter.
+14. **Pane-to-session binding.** It comes from `$TMUX_PANE`, which the hook client records.
+15. **Clearing the dialog flag.** It is agent-scoped, and `idle_prompt` doesn't block typing.
+16. **Stall.** It counts hook events only, uses a longer threshold while a tool is in flight, and stays off during replay. All alerts clear when their condition goes away.
+17. **Hook shim.** A stable shim that exits 0 when kingkai is gone. `init` uses `git check-ignore` and `.git/info/exclude`.
+18. **Shrinking.** The hook client shrinks payloads instead of dropping them. Every string ends up ≤ 512 characters.
+19. **Paths and the session file.** Integrations send absolute paths, and Python makes them relative to `session.json.root`. The session file is read on each request and cached by mtime.
+20. **`SourceFiles`.** It is a domain-owned port, and the domain re-checks containment.
+21. **`Reference` minting.** It is guarded at runtime by a private sentinel and `PLC2701`. Every typer re-checks the grammar.
+22. **HTTP status.** 200 rather than 202, and 429 is listed.
+23. **Docstrings.** ruff `D` is dropped.
+
+---
+
+## 16. Phases (summary; the plan has the detail)
+
+Each phase ends in something that can be demoed, and has exit criteria. The plan lives at `docs/superpowers/plans/2026-10-19-kingkai-roadmap.md`.
+
+| Phase | Delivers | Demo / exit |
+|---|---|---|
+| 0 | Spikes 0a (React source location) and 0b (tmux typing and dialogs). The code is throwaway and never merged. Findings go in `docs/spikes/`. | Q1–Q6 answered. Dialog signatures and real hook fixtures recorded. |
+| 1 | Toolchain, hook client, `init`/`uninstall`, spool, tailers, reducer, TUI with agents, timeline and files | A real Claude Code task with 2 subagents shows a live tree and files |
+| 2 | Detectors, transcript usage and cost, alerts and usage panels, session switcher, `doctor` | A forced failure loop raises RetryLoop. Cost updates live. |
+| 3 | HTTP ingress (S1–S11), reference service, tmux and clipboard typers, overlay, `up`, Next.js snippet, e2e | Alt+click in `examples/next-demo` types `@…#L42 ` into the Claude prompt without submitting |
+| 4 | Django loader and middleware (after the Q9 mini-spike), e2e | The same as Phase 3, from a Django template |
+| 5 | Public polish: README with a GIF recorded on a personal project, docs, a v0.1.0 GitHub release | A fresh clone works end to end following only the README |
+
+### Q-S9: residual risk of typing into a dialog (**for the maintainer**)
+
+Hooks are async and polled, so the domain's dialog flag can be up to a few hundred ms late. The `capture-pane` signature check (§8.4) closes most of that window, but it is a heuristic that depends on Claude Code's UI text. If a dialog is open and missed, the digits in `#L42` could select a menu option. Spike 0b measures whether that can actually happen. One of these policies has to be chosen before Phase 3:
+
+- **(a) Default:** layered checks, and kingkai types whenever they all pass. If Spike 0b shows that a dialog *can* be triggered by typed text, kingkai switches to bracketed paste, provided the spike shows a paste can't trigger it.
+- **(b) Strict:** kingkai types only when no turn is open (Claude is idle at the prompt). During a turn, references always go to the clipboard.
+- **(c) Paranoid:** kingkai always uses the clipboard, unless the user presses a key in the kingkai pane to confirm.
