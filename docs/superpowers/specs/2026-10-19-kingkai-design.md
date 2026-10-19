@@ -127,6 +127,7 @@ src/kingkai/
     http/app.py           aiohttp application factory
     http/guards.py        host/origin/token/content-type/size checks (pure functions)
     tmux.py               TmuxPromptTyper
+    tmux_dialogs.py       dialog screen signatures (data, with fixture screens)
     clipboard.py          WSL / macOS / Wayland / X11 clipboards
     source_files.py       real-filesystem SourceFiles
     settings_installer.py idempotent hook install/uninstall in settings.local.json
@@ -637,7 +638,7 @@ There is one test tree, and it mirrors `src/`. The test pyramid weighs heavily t
 
 ### 11.1 Unit tests (fast, pure; most of the suite)
 
-- **Domain.** The reducer, the detectors, reference parsing and rendering, and usage/cost, all with table-driven `pytest.mark.parametrize`. A `FakeClock` and a `FakeSourceFiles` (an in-memory tree that includes symlink entries) are injected.
+- **Domain.** The reducer, the detectors, reference parsing and rendering, and usage/cost, all with table-driven `pytest.mark.parametrize`. A `FakeClock` and a `FakeSourceFiles` (an in-memory tree; real symlinks are tested against the real adapter, S4) are injected.
 - **Property tests** (hypothesis):
   - For any interleaving of the `Started` and `Succeeded`/`Failed` events of a set of tool calls, `reduce` gives the same **per-tool-call state** and the same file touches (out-of-order tolerance). Turn state, dialog flags, alerts and last activity *depend on order by design*, so they get example-based tests instead.
   - Applying an event twice is the same as applying it once (idempotency).
