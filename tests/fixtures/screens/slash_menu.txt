@@ -35,11 +35,9 @@
   one hundred forty-six
   one hundred forty-seven
 
-  ❯ /craft-prompt                                                Convierte una petición tuya (vaga o detallada) en un prompt impecable en inglés para Claude Code, con modelo, effort y ultracode
-                                                                 recomendados. Aplica además las prácticas oficiales de prompting del modelo destino (Fable 5/5.1/Mythos 5, Opus 5.5, Opus 5 o Sonnet…
-    /superpowers:brainstorming                                   (superpowers) You MUST use this before any creative work - creating features, building components, adding functionality, modifying
-                                                                 behavior, or planning anything new, in software or out of it (a talk, a business, a renovation).
-    /superpowers:writing-plans                                   (superpowers) Use when you have a spec or requirements for a multi-step task, before touching code
+  ❯ /help                                                       Show help and available commands
+    /clear                                                   Clear conversation history and free up context
+    /compact                                                 Clear conversation history but keep a summary in context
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ /
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

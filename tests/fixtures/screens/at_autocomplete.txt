@@ -37,10 +37,10 @@
 
 
     + src/big.ts
-    + /home/user/.claude/skills/craft-prompt/references/opus-5-best-practices.md
-    + /home/user/.claude/skills/craft-prompt/references/sonnet-5-best-practices.md
-    + /home/user/.claude/skills/craft-prompt/references/opus-5-5-best-practices.md
-    + /home/user/.claude/skills/craft-prompt/references/fable-best-practices.md
+    + src/components/Button.tsx
+    + src/app/page.tsx
+    + src/lib/utils.ts
+    + src/app/layout.tsx
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ @src/bi and fix it
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
