@@ -75,7 +75,7 @@ The findings are in `docs/spikes/0a-react-source.md` and `docs/spikes/0b-tmux-ty
 - `uv run pytest`, `uv run mypy`, `uv run ruff check`, `uv run ruff format --check` and `uv run lint-imports` all pass.
 - CI is green.
 - Branch coverage is ≥ 85 %.
-- Every §9 test owned by Phase 1 (S10, and the reducer tests of S9) exists and passes.
+- Every §9 test owned by Phase 1 (S10, the reducer tests of S9, and S12) exists and passes.
 
 ### Task 1.1: Project scaffold and toolchain
 
@@ -85,7 +85,7 @@ The findings are in `docs/spikes/0a-react-source.md` and `docs/spikes/0b-tmux-ty
 - Create: `tests/__init__.py`, `tests/support/__init__.py`, `tests/test_smoke.py`
 - Create: `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `.github/dependabot.yml`, `.importlinter`, `CONTRIBUTING.md`
 - Create: `examples/next-demo/` (`npx create-next-app@latest next-demo --ts --app --no-eslint --src-dir --use-npm --yes`) and `examples/next-demo/.claude/.gitkeep`. The empty `.claude/` makes it a project root (§5.2).
-- Modify: `.gitignore`. Remove the template's `lib/` and `lib64/` lines, which would hide `src/lib/` in the demo. Add `node_modules/`, `.next/` and `src/kingkai/assets/overlay.js`.
+- Modify: `.gitignore`. Remove the template's `lib/` and `lib64/` lines, which would hide `src/lib/` in the demo. Add `node_modules/`, `.next/`, `src/kingkai/assets/overlay.js`, `examples/*/.claude/settings.local.json` and `examples/*/.kingkai/`.
 
 **Interfaces:**
 - Produces:
@@ -137,7 +137,8 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
   - `FileTouch(path: str, kind: Literal["read","write","search"])`.
   - `ToolCall(tool_use_id, agent, tool, summary, input_fingerprint, touches, status: Literal["running","succeeded","failed","abandoned"], started_at: datetime | None, ended_at: datetime | None, duration_ms: int | None, error_summary: str | None)`.
   - `AgentNode(ref, agent_type: str, status: Literal["running","done"], started_at: datetime)`.
-  - `SessionState(session_id, agents: Mapping[AgentRef, AgentNode], calls: Mapping[ToolUseId, ToolCall], call_order: tuple[ToolUseId, ...], turn_open: bool, awaiting_permission: Mapping[AgentRef, datetime], ended: bool, started_at: datetime | None, last_activity: datetime | None, seen: frozenset[EventId], tmux_pane: str | None, transcript_path: str | None)`. `SessionState.initial(session_id)` creates the main agent node lazily.
+  - `SessionState(session_id, agents: Mapping[AgentRef, AgentNode], calls: Mapping[ToolUseId, ToolCall], call_order: tuple[ToolUseId, ...], turn_open: bool, awaiting_permission: Mapping[AgentRef, datetime], ended: bool, started_at: datetime | None, last_activity: datetime | None, seen: frozenset[EventId], tmux_pane: str | None, transcript_path: str | None)`. 
+  - `SessionState.initial(session_id)` starts with an empty `agents` mapping. The first event for the session adds the main node (`agent_type="main"`, `started_at` = that event's `at`). A subagent node created from a `ToolCallStarted` whose `agent_type` is None or empty gets `agent_type="unknown"`.
   - The events of §4.2 except `UsageRecorded`, `Tick` and `ReplayCompleted` (those come in Phase 2). All have the base fields `session_id`, `event_id`, `at`.
   - `reduce(state, event) -> SessionState`.
 
@@ -192,8 +193,10 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
 - Produces:
   - `shrink(payload: dict[str, object]) -> dict[str, object]`: cuts top-level fields first, then hashes recursively, as in §5.1.
   - `envelope(payload, *, event_id: str, at: datetime, pane: str | None) -> dict[str, object]`.
+  - `default_state_dir(env: Mapping[str, str]) -> Path`, implementing the `$XDG_STATE_HOME` rule in §5.1.
   - `project_key(root: str) -> str`.
   - `spool_path(state_dir: Path, root: str, session_id: str) -> Path | None`.
+  - These three functions are the **only** implementation of the spool layout. `bootstrap` and the installer import them from `kingkai.hook_client.spool`, which the composition layer may do, so the hook client and the daemon can't drift apart.
   - `append_line(path: Path, line: bytes) -> None`, which creates directories with mode 0700 and the file with mode 0600, and writes under `flock`.
   - `main(stdin: BinaryIO = sys.stdin.buffer, env: Mapping[str, str] = os.environ, now: Callable[[], datetime] = …, new_id: Callable[[], str] = lambda: uuid4().hex) -> int`.
   - `tests/support/spool.py`:
@@ -248,6 +251,7 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
     - the two S10 shim tests named in §9, which run the shim with a real `sh`
     - `test_shim_quotes_paths_with_spaces`
   - project root:
+    - `test_nested_root_uses_toplevel_exclude`: the root is a subdirectory of a git repo, and the entry lands in that repo's `info/exclude` with a toplevel-relative path
     - `test_find_project_root_walks_up_to_git`
     - `test_find_project_root_stops_at_nearest_claude_dir`
     - `test_home_claude_dir_not_treated_as_project`
@@ -258,7 +262,7 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
     - `test_init_requires_yes_when_not_a_tty`
     - `test_init_adds_settings_local_to_git_exclude_when_not_ignored`
 - [ ] **Step 2: Run them.** They must FAIL. **Step 3:** implement; the diff preview uses `difflib.unified_diff`. **Step 4:** they must PASS.
-- [ ] **Step 5: Try it by hand.** In `examples/next-demo`, run `uv run kingkai init --yes`, then `cat .claude/settings.local.json` and `git check-ignore .claude/settings.local.json`. Expected: the 11 hooks, and the file reported as ignored.
+- [ ] **Step 5: Try it by hand.** In `examples/next-demo`, run `uv run kingkai init --yes`, then `cat .claude/settings.local.json` and `git check-ignore .claude/settings.local.json`. Expected: the 11 hooks, and the file reported as ignored (through the kingkai repo's `.gitignore` entry from Task 1.1).
 - [ ] **Step 6: Commit:** `feat(cli): install and remove hooks in settings.local.json via a stable shim`.
 
 ### Task 1.6: NDJSON tailer
@@ -301,6 +305,8 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
 
 - [ ] **Step 1: Write the failing tests:**
   - one test per hook fixture, asserting the exact domain event, for example `test_pre_tool_use_subagent_fixture` with the agent, `agent_type`, touches and summary
+  - `test_permission_cancelled_run_leaves_dialog_flag_and_abandons_call`: replaying `session_permission_cancelled.ndjson` sets the main agent's dialog flag, leaves the Bash call `running`, and marks it `abandoned` at `SessionEnded`
+  - `test_pre_compact_fixture` (from the synthetic `pre_compact.json`)
   - `test_full_run_replays_to_expected_tree`: `fixture_spool("session_full_run.ndjson")` → decode → reduce gives 2 visible subagents (both `general-purpose`), 3 failed `Bash` calls, no auxiliary agents, and `ended`
   - `test_task_notification_prompt_is_system_turn`
   - `test_unknown_event_returns_none`
@@ -326,7 +332,7 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
     - `subscribe(cb: Callable[[SessionState], None]) -> Callable[[], None]`, which returns an unsubscribe function;
     - a `diagnostics: Diagnostics` attribute.
   - `SessionService(store, sources: Sequence[EventSource])` with `async run()` and `apply(event)`. `apply` is synchronous so tests can call it directly.
-  - `SpoolDirectory(dir: Path, *, scan_interval: float, sleep: Sleeper, now: Callable[[], datetime], tailer_factory: Callable[[Path], NdjsonTailer], on_skip: Callable[[str], None])`, implementing `EventSource`.
+  - `SpoolDirectory(dir: Path, *, scan_interval: float, sleep: Sleeper, clock: Clock, tailer_factory: Callable[[Path], NdjsonTailer], on_skip: Callable[[str], None])`, implementing `EventSource`.
   - `SystemClock`.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -359,7 +365,7 @@ git push   # then check the run in GitHub Actions (gh is not authenticated; use 
     - the title includes `live`, `idle` (no activity for over 30 min) or `ended`;
     - the footer shows the skipped-line counts.
   - `present(state: SessionState | None, now: datetime, *, root: Path, skipped: Mapping[str, int]) -> ScreenVM`.
-  - `pick_session(sessions: Sequence[SessionState], pane: str | None) -> SessionState | None`, which applies the rule in §5.2.
+  - `pick_session(sessions: Sequence[SessionState], pane: str | None) -> SessionState | None`, which applies the rule in §5.2 (newest means latest `started_at`).
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_tree_nests_subagents_under_main`

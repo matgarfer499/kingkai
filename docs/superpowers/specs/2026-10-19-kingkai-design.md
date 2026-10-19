@@ -43,7 +43,7 @@ Each line gives the decision, then the reason. The evidence is in `docs/spikes/`
 ## 2. Glossary
 
 - **Session:** one Claude Code conversation, identified by `session_id`.
-- **Agent:** the main agent (it has no `agent_id`) or a subagent (`agent_id` plus `agent_type`). **Auxiliary agents** are Claude Code's hidden internal agents, such as prompt suggestion. They have no `agent_type` and are ignored.
+- **Agent:** the main agent (it has no `agent_id`) or a subagent (`agent_id` plus `agent_type`). **Auxiliary agents** are Claude Code's hidden internal agents, such as prompt suggestion. Their `agent_type` is missing or empty, and they are ignored.
 - **Hook payload:** the JSON that Claude Code writes to a hook command's stdin.
 - **Spool:** an append-only NDJSON file of one session's hook payloads. Each line is a shrunk payload with a `_kk` envelope added.
 - **Transcript:** Claude Code's own JSONL file under `~/.claude/projects/<encoded-cwd>/`. Its format is internal and **undocumented**; the docs say it "changes between versions".
@@ -152,7 +152,9 @@ scripts/scrub_fixtures.py turns recorded hook, transcript and screen captures in
 1. **Ports and adapters, with `typing.Protocol`.** Claude Code's formats are undocumented or move fast, and tmux, the clipboard and the filesystem are side effects. Protocols let the use cases run in tests against in-memory fakes, with no mocks. They are structural, so adapters don't inherit from anything.
 2. **Functional core, imperative shell.** All decisions (state transitions, alerts, reference validation, cost) are pure functions in `domain`. The shell only moves bytes, so most tests are plain function calls with table-driven inputs.
 3. **State as a fold over events.** `SessionState = reduce(reduce(initial, e1), e2) …`. Replay after a restart is the same code path as live updates. Out-of-order async hooks are handled in one place, the reducer. There is no event store beyond the spool and no snapshots: sessions are small.
-4. **Parse, don't validate.** A `Reference` exists only if `parse_reference()` accepted the input, and once you hold one it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects typing free text. Construction is closed (S7): `Reference.__init__` always raises, and only the private `Reference._mint()` builds instances. It is called from `parse_reference` alone, which ruff `SLF001` and an architecture test enforce. `Reference` is a plain slotted class, not a dataclass, so `dataclasses.replace` can't copy one.
+4. **Parse, don't validate.** A `Reference` exists only if `parse_reference()` accepted the input, and once you hold one it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects typing free text. Construction is closed (S7):
+   - `Reference.__init__` always raises. Only the private `Reference._mint()` builds instances, and `parse_reference` is its only caller: the one call carries `# noqa: SLF001`, ruff `SLF001` flags any other, and an AST test scans `src/`.
+   - `Reference` is a plain slotted class, not a dataclass, so `dataclasses.replace` can't copy one. `__setattr__` and `__delattr__` raise, so it is immutable.
 5. **Anti-corruption layer.** `adapters/hooks` and `adapters/transcript` are the **only** modules that know Claude Code's field names. When a release changes them, the fix stays in one place, and the fixture tests (§11.2) show what broke.
 6. **Strategy, for detectors.** Each alert rule is a small object that satisfies `Detector`. `SessionService` gets a tuple of them, so a new rule means a new file and one line in `bootstrap.py`.
 7. **Composition root and constructor injection.** `bootstrap.build_app()` is the only place that builds concrete adapters. There is no DI container: about ten objects are wired by hand in one readable function.
@@ -206,8 +208,8 @@ def reduce(state: SessionState, event: DomainEvent) -> SessionState: ...
 
 `kingkai init` installs the hooks in `.claude/settings.local.json`, and `kingkai uninstall` removes them. Both commands are idempotent. kingkai recognises its own entries by their command path (the shim), so it leaves user hooks alone.
 
-- **Ignore check.** `init` runs `git check-ignore .claude/settings.local.json`. If the file isn't ignored, `init` offers to add it to `.git/info/exclude`, which stays local. The user's `.gitignore` is never touched.
-- **Stable shim.** The hook command is `~/.local/state/kingkai/bin/kingkai-hook`, a POSIX `sh` file that `init` writes. The interpreter path is quoted with `shlex.quote`.
+- **Ignore check.** `init` runs `git -C <root> check-ignore -q .claude/settings.local.json`. If the file isn't ignored, `init` offers to add it to the repository's local exclude file, which is never committed. The root may be a subdirectory of the repository (a monorepo app, or `examples/next-demo` in this repo), so `init` finds that file with `git -C <root> rev-parse --git-path info/exclude` and writes the path relative to `git rev-parse --show-toplevel`. The user's `.gitignore` is never touched. Outside a git repository, the step is skipped.
+- **Stable shim.** The hook command is `<state>/bin/kingkai-hook`, a POSIX `sh` file that `init` writes. `<state>` is the state directory from §5.1. Both the interpreter path inside the shim and the command string in `settings.local.json` are quoted with `shlex.quote`, so a home directory with spaces works.
 
   ```sh
   #!/bin/sh
@@ -348,7 +350,7 @@ Each detector is `(before: SessionState, event, now) -> AlertChanges`, holding t
 - **`SpoolDirectory`.** It scans the project's spool dir every second and tails each `*.ndjson` file modified in the last 24 h, from offset 0. It reports undecodable lines through an injected `on_skip(reason)` callback, which feeds `Diagnostics`.
 - **`ReplayCompleted`** is emitted once every file has been read to EOF at startup.
 - **Which session is shown:**
-  - With `--pane`, the newest session whose `tmux_pane` matches; otherwise the newest session.
+  - With `--pane`, the newest session (by `started_at`) whose `tmux_pane` matches; otherwise the newest session by `started_at`.
   - The view auto-follows newer sessions until the user presses `s`, which cycles through sessions.
 - **Project root.** `find_project_root(start, home)` walks up from the cwd to the nearest directory containing `.git/` or `.claude/`. It **stops below `home`**, because `~/.claude` is user config, not a project. If it finds nothing, it uses the cwd. `--root` overrides all of this. `doctor` warns if the spool keys found don't match the resolved root.
 
@@ -539,7 +541,7 @@ Details:
 - tmux never parses the text for key names or `;`.
 - kingkai never calls `send-keys`.
 
-**Checks before typing (policy (a)).** Every check must pass; otherwise the tmux typer returns `Declined` and the clipboard is tried.
+**Checks before typing (policy (a)).** Every check must pass; otherwise the clipboard is used. Check 1 runs in `ReferenceService`, which skips the tmux typer when it fails. Checks 2 and 3 run inside the tmux typer, which returns `Declined` when either fails.
 1. **Dialog flag** (in `ReferenceService`). Use the newest session whose `tmux_pane` equals the target pane. If any agent in it has a dialog flag set **less than 10 s ago**, decline.
    - Older flags are not cleared. They are left to check 3, because `PermissionRequest` can fire seconds before the dialog appears.
    - If no session is bound to the pane yet, this check passes.
@@ -630,7 +632,7 @@ The test tree mirrors `src/`, and the pyramid is weighted towards pure tests.
   - **Out-of-order tolerance:** for any interleaving of a set of calls' start and end events, the per-call state and the file touches are the same. Turn state, dialog flags, alerts and activity depend on order by design, so they get example tests instead.
   - **Idempotency:** applying an event list twice gives the same state as applying it once.
   - **References:** for any generated candidate, `parse_reference` either rejects it or returns a `Reference` whose rendered text matches the grammar and resolves inside the root.
-  - **Shrink:** for any payload, `shrink` returns JSON in which every string is ≤ 512 characters, and whose fingerprints are equal exactly when the inputs are equal.
+  - **Shrink:** for any payload, `shrink` returns JSON in which every string is ≤ 512 characters. The fingerprints of two shrunk `tool_input`s are equal exactly when the original `tool_input`s are equal. The cut top-level display fields aren't part of the fingerprint.
 - **Presenters.** State in, view model out. No Textual.
 
 ### 11.2 Contract tests against Claude Code formats
