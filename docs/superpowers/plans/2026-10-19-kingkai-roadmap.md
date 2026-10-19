@@ -64,20 +64,20 @@ These are the five input classes or failure modes most likely to bite a user tha
 - Create: `docs/spikes/0a-react-source.md`
 - Scratch, not committed: `spike-0a/` holding a throwaway Next.js 16.4 app, or a branch of `~/dev/portfolio-web` that is never pushed.
 
-- [ ] **Step 1: Create a scratch Next.js app** (`npx create-next-app@latest spike-0a --ts --app`) and check that `next` is 16.4.x and `react` is 19.3.x. Add 4 cases:
+- [x] **Step 1: Create a scratch Next.js app** (`npx create-next-app@latest spike-0a --ts --app`) and check that `next` is 16.4.x and `react` is 19.3.x. Add 4 cases:
   - (a) a client component `src/components/Counter.tsx` with `'use client'`;
   - (b) a server component `src/app/page.tsx`;
   - (c) a list `items.map(i => <Item key=…/>)`;
   - (d) `src/components/ui/Button.tsx`, imported from (a) and (b).
-- [ ] **Step 2: Method A.** Add `code-inspector-plugin@2.0.9` via `turbopack: { rules: codeInspectorPlugin({ bundler: 'turbopack' }) }`. In DevTools, record the `data-insp-path` values for cases a–d. Write down each value's exact format (absolute or relative, and the `file:line:col:tag` order). Check that they survive HMR: edit the file, insert 3 lines above, and confirm the line shifts.
-- [ ] **Step 3: Method B.** Paste a 30-line test script into the console. It walks DOM → `__reactFiber$*` → `_debugStack`, and symbolicates with `bippy@0.7.3` (via an esm.sh import). Record the resolved `file:line` for cases a–d, and the URL scheme of the raw frames (`webpack-internal://`, `rsc://`, `file://`).
-- [ ] **Step 4: Write `docs/spikes/0a-react-source.md`** containing:
+- [x] **Step 2: Method A.** Add `code-inspector-plugin@2.0.9` via `turbopack: { rules: codeInspectorPlugin({ bundler: 'turbopack' }) }`. In DevTools, record the `data-insp-path` values for cases a–d. Write down each value's exact format (absolute or relative, and the `file:line:col:tag` order). Check that they survive HMR: edit the file, insert 3 lines above, and confirm the line shifts.
+- [x] **Step 3: Method B.** Paste a 30-line test script into the console. It walks DOM → `__reactFiber$*` → `_debugStack`, and symbolicates with `bippy@0.7.3` (via an esm.sh import). Record the resolved `file:line` for cases a–d, and the URL scheme of the raw frames (`webpack-internal://`, `rsc://`, `file://`).
+- [x] **Step 4: Write `docs/spikes/0a-react-source.md`** containing:
   - a results table (case × method → correct?/value);
   - the setup lines each method needs;
   - the decision for Q1;
   - the exact path prefixes for Q2, which feed the normalizer list in spec §8.1.
-- [ ] **Step 5: Update spec §8.2 and §13** with the decision.
-- [ ] **Step 6: Commit**
+- [x] **Step 5: Update spec §8.2 and §13** with the decision.
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/spikes/0a-react-source.md docs/superpowers/specs/2026-10-19-kingkai-design.md
@@ -557,7 +557,7 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 ### Task 3.1: Reference domain (grammar, parsing, minting)
 **Files:** `domain/reference.py`, `tests/domain/test_reference.py`, `tests/domain/fakes.py` (`FakeSourceFiles`)
 **Interfaces:** exactly as in spec §3.5. Also:
-- `RawReference(file: str, line: int)`
+- `RawReference(file: str, line: int)` (`file` is an absolute `file://` URL or an absolute POSIX path; anything else gets `bad_scheme`)
 - `RejectionReason` StrEnum with `control_char, bad_scheme, outside_root, not_a_file, missing, bad_segment, bad_line, too_long`
 - `GRAMMAR: re.Pattern[str]`
 - the private `_MINT = object()`
@@ -591,7 +591,7 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 - `DeliveryOutcome = Typed | Declined(reason)`
 - It records `last_reference` in the store for the TUI.
 
-**Key tests:** `test_permission_request_falls_back_to_clipboard`, `test_uses_session_bound_to_target_pane`, `test_label_selector_page_view_never_typed`, `test_all_typers_decline_returns_shown`.
+**Key tests:** `test_first_valid_candidate_wins`, `test_node_modules_frame_skipped_when_outside_root`, `test_permission_request_falls_back_to_clipboard`, `test_uses_session_bound_to_target_pane`, `test_label_selector_page_view_never_typed`, `test_all_typers_decline_returns_shown`.
 
 ### Task 3.5: tmux typer, pane inspector, dialog signatures
 **Files:** `adapters/tmux.py`, `adapters/tmux_dialogs.py`, `tests/adapters/test_tmux.py`, `tests/integration/test_tmux_real.py`, `tests/integration/byte_recorder.py`
@@ -624,11 +624,11 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 ### Task 3.7: Browser overlay (TypeScript)
 **Files:** `overlay/{package.json,tsconfig.json,biome.json,src/index.ts,src/source.ts,src/ui.ts,src/api.ts,test/*.test.ts}`, a build script that writes `src/kingkai/assets/overlay.js` (gitignored), the CI job `overlay`, and the hatch-free build step in `ci.yml`
 **Interfaces:**
-- `readSource(el: Element): RawSource | null`, which tries `data-insp-path` first, then the runtime method only if Spike 0a chose it
+- `resolveCandidates(el: Element, appRoot: string): Promise<Candidate[]>`: the runtime owner stack through `bippy/source` (`getSource(fiber, false)`, `getOwnerStack`), with `about://React/<Env>/` frames resolved via `POST /__nextjs_original-stack-frames` (`line1`/`column1`). Relative results are made absolute with `appRoot`. It returns at most 10 candidates, innermost first (Spike 0a).
 - `post(url, token, body): Promise<Result>`
 - The shadow-root UI shows the highlight, the label and toasts. Clicks are captured in the capture phase with `preventDefault` and `stopPropagation`.
 
-**Key tests (Vitest):** `parses_data_insp_path_variants`, `walks_up_to_nearest_annotated_ancestor`, `builds_v1_body`, `restart_toast_on_403_token_or_network_error`, `esc_cancels_highlight`.
+**Key tests (Vitest):** `text_node_uses_parent_element`, `about_react_frames_resolved_via_next_endpoint` (mocked fetch), `relative_endpoint_paths_made_absolute_with_app_root`, `caps_candidates_at_10`, `no_fiber_shows_cannot_locate`, `builds_v1_body`, `restart_toast_on_403_token_or_network_error`, `esc_cancels_highlight`.
 
 ### Task 3.8: `kingkai up`, the Next.js snippet, the e2e test
 **Files:** `cli.py` (`up`, `init --next` snippet text in `adapters/snippets.py`), `examples/next-demo/src/app/kingkai-overlay.tsx` (the snippet applied to the demo), `tests/e2e/test_next_click.py`, CI job `e2e`
@@ -636,6 +636,8 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 - `test_up_creates_session_with_two_panes_and_records_claude_pane`, run against a fake `AsyncRunner` with the argv asserted
 - `test_up_strips_parent_claude_code_env_vars`
 - `test_next_snippet_reads_session_file_per_request_and_renders_nothing_when_stale`
+- `test_next_snippet_renders_app_root_attribute`
+- e2e: `test_four_spike_cases_resolve` (client root, server element, `.map` item, imported `ui/Button`; the expected lines are the ones in `docs/spikes/0a-react-source.md`)
 - e2e: `test_alt_click_types_reference_bytes`
 - e2e: `test_foreign_origin_page_gets_403`
 - e2e: `test_click_after_kingkai_restart_shows_reload_toast`

@@ -480,40 +480,47 @@ Request body (≤ 4 KiB, `Content-Type: application/json`):
 
 ```json
 { "v": 1,
-  "source": { "kind": "react", "file": "src/components/Button.tsx", "line": 42, "column": 7 },
+  "kind": "react",
+  "candidates": [
+    { "file": "file:///home/user/dev/myapp/node_modules/next/dist/client/app-dir/link.js", "line": 787, "column": 3 },
+    { "file": "file:///home/user/dev/myapp/src/components/ui/Button.tsx", "line": 5, "column": 5 } ],
   "label": "Button",                 "selector": "main > div:nth-child(2) > button",
   "page": "http://localhost:3000/settings" }
 ```
 
-- `source.kind` is `react` or `django`.
-- `source.file` may be relative to the project root, absolute, or a `file://` URL. Before validation, the adapter normalizes it with a **closed list** of prefixes: `file://`, plus whatever Spike 0a finds the chosen React method produces.
-- `label`, `selector`, `page` and `view` (Django's `kingkai-view` meta, shown next to the reference) are **only displayed in the TUI**. They are never typed, and before display they are **stripped** of control characters and cut to 120 characters. The `source.*` fields are **rejected** if they contain any (S6).
+- `kind` is `react` or `django`.
+- `candidates` lists 1–10 owner-stack frames, innermost first. Django sends exactly one.
+- Python checks each candidate with `parse_reference` and **uses the first that passes**: the first frame inside the project that is a real file. This keeps every containment decision in Python (S4), so the overlay never needs to know the root. If none passes, the reason given is the one for the first candidate.
+- `candidates[].file` is either an absolute `file://` URL or an absolute POSIX path. Python accepts nothing else; any other scheme is `bad_scheme`.
+  - The overlay resolves every raw React frame URL itself: `http(s)://…/_next/static/chunks/…` and `about://React/<Env>/…` (Spike 0a).
+  - Paths that Next's endpoint returns relative to the Next.js app root are made absolute using `data-kingkai-app-root`.
+- `label`, `selector`, `page` and `view` (Django's `kingkai-view` meta, shown next to the reference) are **only displayed in the TUI**. They are never typed, and before display they are **stripped** of control characters and cut to 120 characters. A `candidates[]` entry that contains any is **rejected** (S6).
 
 Responses:
 - `200 {"status": "typed" | "copied" | "shown", "text": "@src/components/Button.tsx#L42 "}`. Delivery finishes before the response is sent.
 - `400` / `403` / `413` / `415` / `422` / `429 {"error": "<code>"}`, where `<code>` is a `RejectionReason` or a guard code.
 
-### 8.2 React 19 / Next.js 16: where the source location comes from (open question → Spike 0a)
+### 8.2 React 19 / Next.js 16: where the source location comes from (decided by Spike 0a)
 
-React 19 removed `_debugSource` and the `__source` JSX prop (react#28265). The two candidate replacements:
+React 19 removed `_debugSource` and the `__source` JSX prop (react#28265). Spike 0a (`docs/spikes/0a-react-source.md`) tested a build-time attribute (code-inspector-plugin) against a runtime owner stack.
 
-| | **A. Build-time attribute** | **B. Runtime owner stack** |
-|---|---|---|
-| How | `code-inspector-plugin` 2.0.9 through `turbopack.rules` adds `data-insp-path="file:line:col:tag"` | Read the DOM node's fiber, then `_debugStack`, then symbolicate with source maps (what bippy 0.7 / react-grab do) |
-| Server Components | Works: the attribute is in the RSC HTML | Needs Next's private `/__nextjs_original-stack-frames` dev endpoint |
-| Setup | A change to `next.config.ts` | Only the overlay script |
-| Fragility | Loader or Turbopack API changes. DOM rendered by libraries has no attribute. | React internals, a private Next endpoint, the 10k owner-stack limit. `captureOwnerStack()` returns null in DOM event handlers. |
-| Read | Synchronous DOM read | Asynchronous (fetches the maps) |
+**Decision: runtime owner stack only.** The build-time attribute gave the *call site* for every component root, including `.map` items and imported components. It also needs config, opens an IDE server on all interfaces, and its hotkey clashes with ours.
 
-**Spike 0a must answer these:**
-1. Which method gives the right `file:line` on Next 16.4 / React 19.3 with Turbopack in these four cases: (a) a client component, (b) a server component, (c) a list item rendered with `.map`, (d) a component imported from `src/components/ui/`.
-2. In what form the path comes out (absolute? relative? which URL scheme?).
-3. Whether it survives HMR.
-4. How much configuration a user has to add.
+How the overlay resolves an element:
+1. **Fiber.** Take the element, or its `parentElement` for a text node. Its React fiber is under the `__reactFiber$*` key.
+2. **Owner stack.** bippy's `getOwnerStack` / `getSource(fiber, false)`. The `false` disables bippy's source-map cache, which is needed for HMR. `bippy` is pinned to an exact version in `overlay/package.json` and bundled into `overlay.js`.
+3. **Server frames.** Frames like `about://React/<Env>/…` are resolved with `POST /__nextjs_original-stack-frames`, a same-origin request from the page to Next's dev server. Its fields are `line1`/`column1`. It returns paths relative to the Next.js app root, which the overlay makes absolute with `data-kingkai-app-root`.
+4. **Send.** Up to 10 resolved frames go to the daemon as `candidates`. Python picks the first one inside the project (§8.1).
 
-**Default if the spike is inconclusive:** A first, falling back to B, as research suggested. The overlay reads `data-insp-path` first and only runs B when it's missing.
+If no fiber is found or nothing resolves, the overlay shows "couldn't locate source". It never guesses.
 
-**Next.js integration in the MVP:** `kingkai init --next` prints a dev-only server component snippet (about 15 lines, for the root layout) that reads `.kingkai/session.json` and renders the script tag, plus the `next.config.ts` lines if method A is chosen. **Decision (my call):** there's no npm package in the MVP. A snippet is easy to audit, and publishing to npm is v2.
+**Fragility we accept:** this depends on React internals, a private Next.js dev endpoint, and bippy. The e2e suite (§11.5) runs the four spike cases on `examples/next-demo` (client component, server component, `.map` item, imported `ui/` component), so a breaking upgrade fails CI.
+
+**Next.js integration in the MVP:**
+- `kingkai init --next` prints a dev-only server component snippet, about 15 lines, for the root layout.
+- The snippet reads `.kingkai/session.json` and renders the script tag with `data-kingkai-url`, `data-kingkai-token` and `data-kingkai-app-root={process.cwd()}`.
+- No `next.config.ts` change is needed.
+- **Decision (my call):** no npm package in the MVP. A snippet is easy to audit, and publishing to npm is v2.
 
 ### 8.3 Django: DEBUG-only template loader (open questions → Phase 3 spike)
 
@@ -607,7 +614,7 @@ kingkai is a process that types into a terminal running an agent with tool acces
 | S3b | *new*: **Force a preflight** | POST requires `Content-Type: application/json`. Otherwise 415, so no "simple" CORS request can get through. | `test_guards.py::test_form_content_type_415`, `::test_text_plain_415` |
 | S3c | *new*: **Body limit** | `client_max_size = 4096` | `test_guards.py::test_oversized_body_413` |
 | S4 | **References only to files that exist inside the project** | `parse_reference` uses `SourceFiles.resolve` (realpath, which follows symlinks) and requires `is_relative_to(realpath(root))`, a regular file, and `1 ≤ line ≤ line_count`. | `tests/domain/test_reference.py::test_dotdot_escape_rejected`, `::test_absolute_outside_root_rejected`, `::test_directory_rejected`, `::test_missing_file_rejected`, `::test_line_zero_and_past_eof_rejected`, `::test_resolved_path_always_inside_root`†, `::test_domain_rechecks_containment_against_lying_adapter`. Real filesystem, using `tmp_path` with real symlinks: `tests/adapters/test_source_files.py::test_symlink_escape_rejected`, `::test_symlinked_parent_dir_escape_rejected`, `::test_symlink_inside_root_allowed`. |
-| S5 | **Normalize the path** | Normalized to POSIX, relative to the root. `.` and `..` segments, empty segments and backslashes are rejected. `file://` and the spike-chosen prefixes are stripped through a closed list. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected`, `::test_backslash_rejected` |
+| S5 | **Normalize the path** | Normalized to POSIX, relative to the root. `.` and `..` segments, empty segments and backslashes are rejected. Input must be an absolute `file://` URL or an absolute POSIX path (Spike 0a). Anything else is `bad_scheme`. Candidates are tried in order, and the first that passes wins. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected` (`http:`, `about:`, `webpack-internal:`, relative paths), `tests/application/test_reference_service.py::test_first_valid_candidate_wins`, `::test_node_modules_frame_skipped_when_outside_root`, `::test_backslash_rejected` |
 | S6 | **No newlines or control characters** | Any char of Unicode category `Cc`, `Cf`, `Zl` or `Zp` in a `source.*` field causes a **rejection**. The same chars are **stripped** from display-only fields. The rendered text must match the grammar regex (§8.4). | `test_reference.py::test_rejects_control_chars` (parametrized over `\n \r \t \x00 \x1b   ‮ ​`). `::test_render_matches_grammar`†. `::test_render_never_contains_cr_lf_esc`†. `tests/adapters/http/test_payload.py::test_display_fields_stripped_not_rejected`. |
 | S7 | **No free text, only `@path<sep>line `** | Typing goes through `PromptTyper.type_reference(ref: Reference)`, which takes no `str` (mypy enforces this). `Reference` can only be minted through `parse_reference`: `__post_init__` checks for the private `_MINT` sentinel, and ruff `PLC2701` bans importing private names. `Reference.render()` checks the grammar regex again, and every typer (tmux and clipboard) types only `render()` output. `label`, `selector`, `page` and `view` are display-only. | `tests/domain/test_reference.py::test_direct_construction_raises`, `::test_render_rechecks_grammar`. `tests/application/test_reference_service.py::test_label_selector_page_view_never_typed`. `tests/adapters/test_clipboard.py::test_copies_only_rendered_reference`. mypy `--strict` and ruff in CI. |
 | S8 | **Never send Enter** | The only commands are `load-buffer -b <buf> -` (text on stdin) and `paste-buffer -p -d -b <buf> -t <pane>`. No code path runs `send-keys`, so no key names are ever sent. The text never contains CR or LF (S6). | `test_tmux.py::test_commands_exact`, and `::test_never_invokes_send_keys`†: for any Reference, exactly two commands run, `["tmux","load-buffer","-b",buf,"-"]` with `stdin == text`, then `["tmux","paste-buffer","-p","-d","-b",buf,"-t",pane]`, and no argv contains `send-keys`. Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline`. It uses a real tmux server on a private `-L` socket; the pane runs a byte recorder that turns bracketed paste on. The test asserts the exact bytes received, `ESC[200~` + text + `ESC[201~`, and that there is no `\r` or `\n`. |
@@ -737,8 +744,8 @@ Versions were checked on PyPI, npm and the GitHub releases on 2026-10-19.
 
 | ID | Question | Resolved by | Default if inconclusive |
 |---|---|---|---|
-| Q1 | React source method: A (build-time) vs B (runtime) vs A then B | Spike 0a | A, falling back to B |
-| Q2 | The path form each method produces | Spike 0a | Normalize `file://` and absolute paths only |
+| Q1 | React source method | **Resolved (0a):** B, the runtime owner stack, alone | — |
+| Q2 | Path forms | **Resolved (0a):** the overlay resolves the raw URLs and sends only absolute `file://` URLs or POSIX paths | — |
 | Q3 | `#L` vs `:` as the separator | **Resolved (0b):** `#L` | — |
 | Q4 | `@` autocomplete, typing mid-text, during a turn, in a dialog | **Resolved (0b):** safe at the prompt. Dialogs need bracketed paste and the layers in §8.4. | — |
 | Q5 | `()` and `[]` in mentions | **Resolved (0b):** they work | — |
