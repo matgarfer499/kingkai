@@ -1,6 +1,6 @@
 
  ▐▛███▛█   Claude Code v2.1.303
-▝▜██████▀  Opus 5.5 · Claude Pro
+▝▜██████▀  Opus 5.5 · Claude
  ▝▝   ▝▝   /home/user/dev/demo
 
 

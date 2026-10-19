@@ -1,8 +1,9 @@
 # kingkai: design spec
 
-- **Status:** draft for review, 2026-10-19
+- **Status:** approved design, revised 2026-10-19 after Phase 0 (spikes) and the pre-Phase-1 review.
 - **Scope:** MVP (v1). Session comparison and the other v2 items are in [§14 Non-goals](#14-non-goals).
 - **Audience:** whoever builds kingkai. It assumes you know Python and asyncio, but not Claude Code internals.
+- **History:** the evidence behind each decision is in `docs/spikes/`, and the change history is in git. This document states only the current design.
 
 > King Kai watches the fight from his planet and speaks straight into Goku's head.
 > kingkai watches Claude Code from a side pane and types straight into its prompt.
@@ -20,37 +21,33 @@ kingkai is a terminal sidekick for Claude Code. It does two things.
    - alerts when the agent looks stuck: the same tool with the same arguments N times, tool errors, retry loops, long silences;
    - tokens and estimated cost for the session;
    - the last reference that was clicked.
-2. **Click-to-reference.** Alt+click an element in the local dev app (Next.js/React 19 or Django templates). The source location of that element, for example `@src/components/Button.tsx#L42 `, is **typed** into the Claude Code prompt as a tmux bracketed paste (`paste-buffer -p`). kingkai never presses Enter. Outside tmux, the reference goes to the clipboard instead.
+2. **Click-to-reference.** Alt+click an element in the local dev app (Next.js/React 19 or Django templates). The source location of that element, for example `@src/components/Button.tsx#L42 `, is inserted into the Claude Code prompt as a tmux bracketed paste. kingkai never presses Enter. Outside tmux, the reference goes to the clipboard instead.
 
 kingkai uses no local AI and makes no network calls beyond 127.0.0.1.
 
-### 1.1 Decisions inherited from the approved plan (settled)
+### 1.1 Settled decisions
 
-- Python, Textual, and tmux for delivery, with a clipboard fallback.
-- Hooks plus JSONL transcripts as the data sources.
-- The security rules in §9.
-- `UserPromptSubmit` context injection is ruled out for the MVP.
+Each line gives the decision, then the reason. The evidence is in `docs/spikes/`.
 
-### 1.2 Where this spec departs from the plan's wording, and why
-
-| Plan says | Spec does | Why |
-|---|---|---|
-| "Daemon" plus a TUI | **One process.** The daemon is a set of services in the same asyncio loop as the Textual app. The boundary between them is a port (§5), so it can be split into two processes later. | Research confirmed that aiohttp runs inside Textual's loop. Two processes would add an IPC protocol, its versioning and lifecycle bugs, and the MVP gains nothing from that. State survives a TUI restart thanks to the event spool (§5.2). |
-| Hook script sends events to the daemon | The hook script **appends to a per-session spool file**, and kingkai tails that file. | A failed command hook shows a `hook error` notice in the Claude Code transcript (hooks docs, "Non-blocking error"). A spool write cannot fail just because kingkai isn't running, so the hook stays silent. The spool also replays history after a restart and handles out-of-order events with the same code. |
-| `@ruta:línea` | `@<path><sep><line> `, where `<sep>` is one value of a closed enum chosen by Spike 0b. The default is `#L` (`@src/x.tsx#L42 `). | Claude Code documents `@file#L1-99` and `@file#5-10` (the IDE integration docs). `@file:line` appears nowhere in the docs. The "no free text" rule still holds: the grammar is fixed (§8.4). |
-| Hooks in `.claude/settings.json` | Hooks go in **`.claude/settings.local.json`**. | That file is per-user and gitignored. kingkai should never change settings that teammates share. |
-| Event list: SessionStart, UserPromptSubmit, Pre/PostToolUse, SubagentStop, Stop | Adds `PostToolUseFailure`, `SubagentStart`, `Notification`, `SessionEnd` and `PreCompact` (§4.1). | The tool-error alert needs `PostToolUseFailure`. The tree needs `SubagentStart` to show a subagent before it ends. Typing must be blocked while a permission dialog is open (§9, rule S9), which needs `Notification`. |
+- **One process.** The "daemon" is a set of services in Textual's asyncio loop. The boundary between them is a port (§5.3), so it can be split into two processes later. A second process would bring IPC and lifecycle bugs and give the MVP nothing.
+- **Hooks append to a spool file; kingkai tails it.** A failed command hook shows a `hook error` notice in Claude Code. A file append can't fail just because kingkai isn't running. The spool also gives replay after a restart for free.
+- **Hooks go in `.claude/settings.local.json`.** It is per-user and gitignored, so kingkai never changes settings that teammates share.
+- **The typed form is `@path#L<line> `.** Spike 0b: Claude Code resolves it and reads exactly that line. `@path:42` doesn't resolve.
+- **Delivery is a tmux bracketed paste, never keystrokes.** Spike 0b: a lone digit keystroke selects an option in a permission dialog, and a paste can't.
+- **React source comes from the runtime owner stack.** Spike 0a: it was correct in every case. A build-time attribute points at call sites instead.
+- **Dialog safety follows policy (a).** The maintainer decided on 2026-10-19: layered checks, then type (§8.4).
+- **`UserPromptSubmit` context injection** stays ruled out.
 
 ---
 
 ## 2. Glossary
 
 - **Session:** one Claude Code conversation, identified by `session_id`.
-- **Agent:** the main agent (it has no `agent_id`) or a subagent (`agent_id` plus `agent_type`).
+- **Agent:** the main agent (it has no `agent_id`) or a subagent (`agent_id` plus `agent_type`). **Auxiliary agents** are Claude Code's hidden internal agents, such as prompt suggestion. They have no `agent_type` and are ignored.
 - **Hook payload:** the JSON that Claude Code writes to a hook command's stdin.
-- **Spool:** an append-only NDJSON file that holds a session's hook payloads after the hook client has shrunk them.
+- **Spool:** an append-only NDJSON file of one session's hook payloads. Each line is a shrunk payload with a `_kk` envelope added.
 - **Transcript:** Claude Code's own JSONL file under `~/.claude/projects/<encoded-cwd>/`. Its format is internal and **undocumented**; the docs say it "changes between versions".
-- **Domain event:** kingkai's typed, versionless representation of something that happened (§4.2).
+- **Domain event:** kingkai's typed representation of something that happened (§4.2).
 - **Reference:** a validated pointer to a project file and line. It is the only thing kingkai will ever type (§8.4).
 - **Overlay:** the dev-only browser script that handles Alt+click.
 
@@ -71,11 +68,11 @@ kingkai uses no local AI and makes no network calls beyond 127.0.0.1.
  ~/.claude/projects/.../<session>.jsonl ────┤ tail (usage only)
                                             ▼
                  ┌──────────────── kingkai process (one asyncio loop) ───────────┐
-                 │ adapters: SpoolTailer, TranscriptTailer → translate → events  │
+                 │ adapters: SpoolDirectory, TranscriptSource → translate        │
                  │ application: SessionService (reducer + detectors) → Store     │
                  │ application: ReferenceService (validate → deliver)            │
-                 │ adapters: HttpIngress (aiohttp, 127.0.0.1:ephemeral)          │
-                 │ ui: Textual app ← Snapshot messages (≤10 Hz)                  │
+                 │ adapters: HTTP ingress (aiohttp, 127.0.0.1:ephemeral)         │
+                 │ ui: Textual app, re-rendered from the Store at most 10×/s     │
                  └──────────────────────────────▲────────────────────────────────┘
                                                 │ POST /v1/references (token + Origin)
  browser: dev app + overlay.js ─────────────────┘
@@ -84,137 +81,122 @@ kingkai uses no local AI and makes no network calls beyond 127.0.0.1.
 
 ### 3.2 Layers and the dependency rule
 
-Dependencies only point inwards. import-linter enforces this in CI (§12), so the layering is checked, not just a convention.
+Dependencies only point inwards. import-linter enforces this in CI (§11.6), so the layering is checked, not just a convention.
 
 | Layer | Package | May import | Contains | Must not contain |
 |---|---|---|---|---|
-| Domain | `kingkai.domain` | stdlib only | Value objects, domain events, the state model, the reducer, alert detectors, usage and cost arithmetic, reference parsing and rendering | I/O, asyncio, Textual, msgspec, `time.time()` |
-| Application | `kingkai.application` | domain | Use cases (`SessionService`, `ReferenceService`), the `Store`, and the **ports** (Protocols) | Concrete I/O, Textual |
-| Adapters | `kingkai.adapters` | domain, application | Hook and transcript schemas plus translation (the anti-corruption layer), tailers, aiohttp ingress, tmux, clipboard, settings installer, pricing loader, config loader | UI |
-| UI | `kingkai.ui` | domain, application | Textual app, widgets, **presenters** (pure functions from state to view models) | Adapters (the UI only sees ports and the store) |
+| Domain | `kingkai.domain` | stdlib only (no asyncio) | Value objects, domain events, the state model, the reducer, alert detectors, usage and cost arithmetic, reference parsing and rendering, the `SourceFiles` port it needs | I/O, asyncio, Textual, msgspec, `datetime.now()` |
+| Application | `kingkai.application` | domain | Use cases (`SessionService`, `ReferenceService`), the `Store`, the supervisor, and the ports (Protocols) | Concrete I/O, Textual |
+| Adapters | `kingkai.adapters` | domain, application | The anti-corruption layer (hook and transcript schemas plus translation), tailers, aiohttp ingress, tmux, clipboard, settings installer, config, pricing and logging | UI |
+| UI | `kingkai.ui` | domain, application | Textual app, widgets, presenters (pure functions from state to view models) | Adapters |
 | Composition | `kingkai.bootstrap`, `kingkai.cli` | everything | Wiring, command-line parsing | Logic |
-| Hook client | `kingkai.hook_client` | **stdlib only, no other `kingkai` module** | Reads stdin, shrinks the payload, appends it to the spool | Anything slow to import |
-| Integrations | `kingkai.integrations.django` | Django, stdlib | DEBUG-only template loader and middleware. Installed via the `kingkai[django]` extra. | Imports of the daemon |
+| Hook client | `kingkai.hook_client` | **stdlib only, and no other `kingkai` module** | Reads stdin, shrinks the payload, adds the envelope, appends it to the spool | Anything slow to import |
+| Integrations | `kingkai.integrations.django` | Django, stdlib | DEBUG-only template loader and middleware (the `kingkai[django]` extra) | Imports of the daemon |
 
 ### 3.3 Module map
 
 ```
 src/kingkai/
   domain/
-    ids.py            SessionId, AgentId, ToolUseId (NewType over str)
+    ids.py            SessionId, AgentId, ToolUseId, EventId (NewType over str)
+    json.py           JsonValue (recursive alias)
     events.py         DomainEvent union (frozen, slotted dataclasses)
-    state.py          SessionState, AgentNode, ToolCall, FileTouch, Alert (frozen)
+    state.py          SessionState, AgentNode, ToolCall, FileTouch, Alert
     reducer.py        reduce(state, event) -> SessionState
-    tools.py          tool_name -> FileTouch extraction (Read/Edit/Write/...)
-    alerts/
-      base.py         Detector Protocol: (state, event, now) -> tuple[Alert, ...]
-      repeated_call.py, tool_failure.py, stall.py
-    usage.py          TokenUsage, Pricing, CostEstimate
-    reference.py      ProjectRoot, ProjectPath, LineNumber, Reference, ReferenceFormat,
-                      RejectionReason, parse_reference(), render(), and the
-                      SourceFiles/ResolvedFile Protocols it needs (a domain-owned port)
+    tools.py          touches_for(), fingerprint()
+    alerts/           base.py (Detector, AlertChanges), repeated_call.py, tool_failure.py,
+                      retry_loop.py, stall.py
+    usage.py          TokenUsage, ModelPrice, Pricing, estimate_cost()
+    reference.py      Reference, RawReference, Rejected, RejectionReason, parse_reference(),
+                      GRAMMAR, SourceFiles / ResolvedFile (domain-owned port)
   application/
-    ports.py          Clock, EventSource, PromptTyper, Clipboard, PaneInspector
-    store.py          Store: holds SessionState per session, notifies subscribers
+    ports.py          Clock, Sleeper, EventSource, PromptTyper, DeliveryOutcome
+    store.py          Store, Diagnostics
     session_service.py
     reference_service.py
+    supervisor.py
   adapters/
-    hooks/schema.py       msgspec Structs for hook payloads (tolerant: unknown fields ignored)
-    hooks/translate.py    payload -> DomainEvent | None
-    transcript/schema.py  msgspec Structs for the transcript lines we read
-    transcript/translate.py
-    tail.py               NdjsonTailer: offset-tracking, partial-line-safe, rotation-aware
-    http/app.py           aiohttp application factory
-    http/guards.py        host/origin/token/content-type/size checks (pure functions)
-    tmux.py               TmuxPromptTyper
-    tmux_dialogs.py       dialog screen signatures (data, with fixture screens)
-    clipboard.py          WSL / macOS / Wayland / X11 clipboards
+    hooks/schema.py, hooks/translate.py
+    transcript/schema.py, transcript/translate.py
+    tail.py               NdjsonTailer
+    spool_source.py       SpoolDirectory (EventSource)
+    transcript_source.py  TranscriptSource (EventSource)
+    clock.py              SystemClock
+    project.py            find_project_root(), ensure_locally_ignored()
+    settings_installer.py install()/uninstall() for settings.local.json, write_shim()
+    http/guards.py, http/payload.py, http/app.py
+    session_file.py       .kingkai/session.json
     source_files.py       real-filesystem SourceFiles
-    settings_installer.py idempotent hook install/uninstall in settings.local.json
-    pricing.py            loads bundled pricing.toml plus user overrides
-    session_file.py       writes .kingkai/session.json (0600)
-    config.py             kingkai.toml -> Config
+    tmux.py               TmuxPromptTyper (pane checks, dialog signatures, paste)
+    clipboard.py          ClipboardTyper + per-platform ClipboardCommand rows
+    snippets.py           text printed by `init --next` / `--django`
+    config.py, pricing.py, logging_setup.py
   hook_client/
-    __main__.py           entry point for the `kingkai-hook` console script
-    shrink.py             pure: payload -> shrunk payload
+    __main__.py, shrink.py, envelope.py, spool.py
   ui/
-    app.py                KingkaiApp(App[None])
-    messages.py           SnapshotUpdated, ReferenceDelivered
-    presenters.py         pure: SessionState -> view models
-    widgets/              agent_tree.py, files.py, timeline.py, alerts.py, usage.py, reference.py
+    app.py, messages.py, presenters.py, widgets/*.py
   integrations/django/
-    loaders.py            SourceAnnotatingLoader (filesystem / app_directories variants)
-    middleware.py         KingkaiMiddleware (script tag + view location)
+    loaders.py, middleware.py
   bootstrap.py            build_app(config) -> KingkaiApp   (the composition root)
   cli.py                  cyclopts app: init, uninstall, up, watch, doctor
-  assets/overlay.js       built from overlay/ by esbuild (not committed; built in CI)
+  assets/overlay.js       built from overlay/ by esbuild (never committed)
   assets/pricing.toml
 overlay/                  TypeScript source for the browser overlay (own package.json)
-examples/next-demo/       minimal Next.js 16 app used by the spikes, e2e tests and demos
-examples/django-demo/     minimal Django 6 app used by the e2e tests and demos
+examples/next-demo/       minimal Next.js 16 app (has its own .claude/), for e2e tests and demos
+examples/django-demo/     minimal Django 6 app, for e2e tests and demos
+scripts/scrub_fixtures.py turns recorded hook, transcript and screen captures into public fixtures
 ```
 
 ### 3.4 Patterns, and why each one is here
 
-Each pattern below solves a specific problem in this codebase. Patterns we deliberately leave out are listed too.
+1. **Ports and adapters, with `typing.Protocol`.** Claude Code's formats are undocumented or move fast, and tmux, the clipboard and the filesystem are side effects. Protocols let the use cases run in tests against in-memory fakes, with no mocks. They are structural, so adapters don't inherit from anything.
+2. **Functional core, imperative shell.** All decisions (state transitions, alerts, reference validation, cost) are pure functions in `domain`. The shell only moves bytes, so most tests are plain function calls with table-driven inputs.
+3. **State as a fold over events.** `SessionState = reduce(reduce(initial, e1), e2) …`. Replay after a restart is the same code path as live updates. Out-of-order async hooks are handled in one place, the reducer. There is no event store beyond the spool and no snapshots: sessions are small.
+4. **Parse, don't validate.** A `Reference` exists only if `parse_reference()` accepted the input, and once you hold one it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects typing free text. Construction is closed (S7): `Reference.__init__` always raises, and only the private `Reference._mint()` builds instances. It is called from `parse_reference` alone, which ruff `SLF001` and an architecture test enforce. `Reference` is a plain slotted class, not a dataclass, so `dataclasses.replace` can't copy one.
+5. **Anti-corruption layer.** `adapters/hooks` and `adapters/transcript` are the **only** modules that know Claude Code's field names. When a release changes them, the fix stays in one place, and the fixture tests (§11.2) show what broke.
+6. **Strategy, for detectors.** Each alert rule is a small object that satisfies `Detector`. `SessionService` gets a tuple of them, so a new rule means a new file and one line in `bootstrap.py`.
+7. **Composition root and constructor injection.** `bootstrap.build_app()` is the only place that builds concrete adapters. There is no DI container: about ten objects are wired by hand in one readable function.
+8. **Presenter / humble view.** Widgets only render view models from `ui/presenters.py`. Presenters are pure and unit-tested, which keeps the Textual layer thin.
+9. **Ordered fallback for delivery.** `ReferenceService` tries a tuple of `PromptTyper`s (tmux, then clipboard), and the result says which one delivered.
 
-1. **Ports and adapters, with `typing.Protocol`.** Claude Code's formats are undocumented or move fast, and tmux, the clipboard and the filesystem are side effects. Protocols in `application/ports.py` let the use cases run in tests against in-memory fakes, with no mocks and no monkeypatching. They are structural, so adapters don't inherit from anything.
-2. **Functional core, imperative shell.** All decisions (state transitions, alerts, reference validation, cost) are pure functions in `domain`. The shell only moves bytes. Most tests are then plain function calls with table-driven inputs.
-3. **State as a fold over events (light event sourcing).** `SessionState = reduce(reduce(initial, e1), e2) …`. Spool replay after a restart is the same code path as live updates. Out-of-order async hooks are handled in a single place, the reducer, and property tests can check order independence (§11). There is no event store beyond the spool file and no snapshots: sessions are small.
-4. **Parse, don't validate (value objects).** A `Reference` comes from `parse_reference()`. Once you hold one, it is safe to type. `PromptTyper.type_reference(ref: Reference)` takes no `str`, so mypy rejects any call that tries to type free text. Python can't truly make a constructor private, so three layers back this up (S7):
-   - `Reference.__post_init__` raises unless it receives the module-private capability sentinel `_MINT`, so a direct `Reference(...)` call fails at runtime.
-   - ruff `PLC2701` flags any import of a private name.
-   - `Reference.render()` checks the result against the grammar regex again before returning, and every typer goes through `render()`, the clipboard as well as tmux.
-5. **Anti-corruption layer.** `adapters/hooks` and `adapters/transcript` are the **only** modules that know Claude Code's field names. When a Claude Code release changes them, the fix stays in one place, and the fixture tests (§11.2) catch the drift.
-6. **Strategy, for detectors.** Each alert rule is a small object that satisfies `Detector`. `SessionService` gets a tuple of them. A new rule means a new file and one line in `bootstrap.py`.
-7. **Composition root and constructor injection.** `bootstrap.build_app()` is the only place that builds concrete adapters. There is no DI container: about ten objects can be wired by hand in one readable function.
-8. **Presenter / humble view.** Widgets only render view models that `ui/presenters.py` computes from state. Presenters are pure and unit-tested, which leaves the Textual layer thin, plus a few Pilot and snapshot tests.
-9. **Ordered fallback for delivery.** `ReferenceService` holds a tuple of `PromptTyper`s (tmux, clipboard) and uses the first one that accepts. The result says which one delivered, and the TUI shows it.
-
-**Not used, on purpose:** DI frameworks; ABC hierarchies; a plugin registry; the repository pattern (there is no database); a generic event bus library (the `Store` with a subscriber list is enough); CQRS; async generators running through the domain (the domain stays sync).
+**Not used, on purpose:**
+- DI frameworks;
+- ABC hierarchies;
+- a plugin registry;
+- the repository pattern (there is no database);
+- an event bus library (`Store` with subscribers is enough);
+- CQRS;
+- async code in the domain.
 
 ### 3.5 Key types (signatures, not bodies)
 
 ```python
 # application/ports.py
 class Clock(Protocol):
-    def now(self) -> datetime: ...              # timezone-aware UTC
-
+    def now(self) -> datetime: ...                       # timezone-aware UTC
+Sleeper = Callable[[float], Awaitable[None]]
 class EventSource(Protocol):
     def events(self) -> AsyncIterator[DomainEvent]: ...
-
 class PromptTyper(Protocol):
-    name: str                                   # "tmux", "clipboard"
+    name: str                                            # "tmux" | "clipboard"
     async def type_reference(self, ref: Reference) -> DeliveryOutcome: ...
-
-class PaneInspector(Protocol):                  # tmux adapter implements it; fakes in tests
-    async def inspect(self, pane: PaneId) -> PaneStatus | None: ...   # None = pane gone
+DeliveryOutcome = Typed | Declined                       # Declined(reason: str)
 
 # domain/reference.py
-class SourceFiles(Protocol):                    # domain-owned port; read-only
-    def resolve(self, root: ProjectRoot, raw: str) -> ResolvedFile | None: ...  # realpath
+class SourceFiles(Protocol):                             # domain-owned port, read-only
+    def resolve(self, root: Path, raw_path: str) -> ResolvedFile | None: ...  # realpath
     def line_count(self, f: ResolvedFile) -> int: ...
-# parse_reference also re-checks ResolvedFile.real_path.is_relative_to(root.real_path),
-# so a buggy SourceFiles adapter can't widen the boundary.
-
-class ReferenceFormat(StrEnum):
-    HASH_L = "#L"                               # default, pending Spike 0b
-    COLON = ":"
-
-@dataclass(frozen=True, slots=True)
-class Reference:
-    path: ProjectPath                           # validated, POSIX, relative to the root
-    line: LineNumber
-    def render(self, fmt: ReferenceFormat) -> str: ...   # "@{path}{fmt}{line} "
-
-def parse_reference(raw: RawReference, root: ProjectRoot, files: SourceFiles
-                    ) -> Reference | Rejected: ...
+class Reference:                                         # __slots__ = ("path", "line")
+    path: str                                            # POSIX, relative to root, NFC
+    line: int
+    def render(self) -> str: ...                         # "@{path}#L{line} ", re-checked against GRAMMAR
+def parse_reference(raw: RawReference, root: Path, files: SourceFiles) -> Reference | Rejected: ...
 
 # domain/reducer.py
 def reduce(state: SessionState, event: DomainEvent) -> SessionState: ...
 ```
 
-`Rejected` is a frozen dataclass that carries a `RejectionReason` (StrEnum). Validation **returns** it instead of raising. A rejection is an expected outcome of handling untrusted input, so the caller has to deal with it, and mypy makes sure of that through the union.
+`Rejected` carries a `RejectionReason` (a StrEnum). Validation **returns** it instead of raising: a rejection is an expected outcome of handling untrusted input, so the caller has to deal with it, and the union type makes mypy check that.
 
 ---
 
@@ -222,115 +204,118 @@ def reduce(state: SessionState, event: DomainEvent) -> SessionState: ...
 
 ### 4.1 Hook events we install
 
-All hooks go in `.claude/settings.local.json`, each with a type `command` handler. `kingkai init` writes them and `kingkai uninstall` removes them. Both commands are idempotent. Every entry kingkai writes is identified by its command path, which is the shim below, so user hooks are left alone.
-- `init` runs `git check-ignore .claude/settings.local.json`. If the file isn't ignored, `init` offers to add it to `.git/info/exclude`. That file is local and never committed, so the user's `.gitignore` is not touched.
-- **A stable shim, so reinstalling can't break hooks.** The hook command is `~/.local/state/kingkai/bin/kingkai-hook`, a POSIX `sh` script written by `init`:
+`kingkai init` installs the hooks in `.claude/settings.local.json`, and `kingkai uninstall` removes them. Both commands are idempotent. kingkai recognises its own entries by their command path (the shim), so it leaves user hooks alone.
+
+- **Ignore check.** `init` runs `git check-ignore .claude/settings.local.json`. If the file isn't ignored, `init` offers to add it to `.git/info/exclude`, which stays local. The user's `.gitignore` is never touched.
+- **Stable shim.** The hook command is `~/.local/state/kingkai/bin/kingkai-hook`, a POSIX `sh` file that `init` writes. The interpreter path is quoted with `shlex.quote`.
 
   ```sh
-  PY="/abs/venv/bin/python"; [ -x "$PY" ] || exit 0; exec "$PY" -I -m kingkai.hook_client
+  #!/bin/sh
+  PY='/abs/venv/bin/python'; [ -x "$PY" ] && "$PY" -I -m kingkai.hook_client >/dev/null 2>&1; exit 0
   ```
 
-  If kingkai is uninstalled or its venv moves, the hook still exits 0 silently. `init` rewrites the shim, and `doctor` checks that it points at a working interpreter.
-
-```json
-{ "hooks": { "PreToolUse": [ { "hooks": [ {
-    "type": "command",
-    "command": "/home/<user>/.local/state/kingkai/bin/kingkai-hook",
-    "async": true,
-    "timeout": 5
-} ] } ] } }
-```
+  If kingkai is uninstalled or its venv moves or breaks, the hook still exits 0 with no output. `init` rewrites the shim, and `doctor` checks that it runs.
+- **Entry shape.** Every installed entry uses `"type": "command"`, `"async": true` and `"timeout": 5`, with no matcher.
 
 | Claude Code event | Why we need it | Fields we read (anything else is ignored) |
 |---|---|---|
 | `SessionStart` | Opens a session and gives the transcript path | `session_id`, `transcript_path`, `cwd`, `source`, `model?` |
-| `UserPromptSubmit` | Opens a turn (the stall detector only runs inside a turn) | `session_id`, `prompt` (only its length and first 80 characters are kept) |
+| `UserPromptSubmit` | Opens a turn. A prompt starting with `<task-notification>` is a **system** turn: Claude Code submits one when a background subagent finishes. | `prompt` (first 80 characters only) |
 | `PreToolUse` | Tool call started | `tool_name`, `tool_input`, `tool_use_id`, `agent_id?`, `agent_type?` |
-| `PostToolUse` | Tool call succeeded | the same as above, plus `duration_ms?` (`tool_response` is shrunk, §5.1) |
-| `PostToolUseFailure` | Tool call failed | the same as above, plus `error`, `is_interrupt?` |
-| `SubagentStart` / `SubagentStop` | Subagent tree. A `SubagentStop` with no `agent_type` for an agent never seen before is an internal auxiliary agent (for example the prompt-suggestion agent) and is ignored. | `agent_id`, `agent_type`, `agent_transcript_path` (on Stop) |
-| `PermissionRequest` | **The dialog signal.** It fires as the permission dialog opens (Spike 0b). It marks the prompt as **not safe to type into**. Our hook never returns a decision. | `tool_name`, `agent_id?` |
-| `Notification` | Informational only. Spike 0b showed it is unreliable for dialogs: it fired for 1 of 3. | `notification_type`, `message` |
-| `Stop` | Closes the turn | `stop_hook_active` |
-| `PreCompact` | Shows compaction on the timeline | `trigger` |
+| `PostToolUse` | Tool call succeeded | the same fields, plus `duration_ms?` |
+| `PostToolUseFailure` | Tool call failed | the same fields, plus `error`, `is_interrupt?` |
+| `SubagentStart` / `SubagentStop` | Subagent tree | `agent_id`, `agent_type`, `agent_transcript_path` (on Stop) |
+| `PermissionRequest` | **The dialog signal.** It fires when the permission dialog opens. Our hook never returns a decision. | `tool_name`, `agent_id?` |
+| `Stop` | Closes the turn (it doesn't fire after a cancelled dialog) | none |
+| `PreCompact` | Compaction shown on the timeline | `trigger` |
 | `SessionEnd` | Closes the session | `reason` |
 
-- **Attribution.** A payload with `agent_id` belongs to that subagent; without it, it belongs to the main agent. This follows the hooks docs, and Spike 0b confirmed it (Q7).
-- **`async: true`.** The hook never blocks Claude, and Claude Code doesn't enforce a timeout on async hooks. The `timeout: 5` is there in case async stops being honoured.
-- **`SessionEnd`.** It has a 1.5 s default timeout. Appending to the spool takes milliseconds, so that is fine.
+- **Attribution.** A payload with `agent_id` belongs to that subagent; without it, it belongs to the main agent.
+- **`async: true`.** The hook never blocks Claude.
+- **`SessionEnd`.** Its 1.5 s default timeout is ample for a file append.
+- **`Notification` isn't installed.** It is unreliable for dialogs (it fired for 1 dialog in 3), and no event reads it.
 
 ### 4.2 Domain events
 
-Domain events are frozen, slotted dataclasses. Every one carries:
+Domain events are frozen, slotted dataclasses. Every event carries:
 - `session_id`;
-- `event_id: str`. For hook events this is a UUID4 that the hook client writes into `_kk.id`. For transcript events it is `"<file>:<byte offset>"`.
-- `at: datetime`, in UTC: when the hook client received the payload, or the transcript line's `timestamp`.
+- `event_id: EventId`: `_kk.id` for hook events, or `"<file>:<byte offset>"` for transcript events;
+- `at: datetime`, in UTC: `_kk.at`, or the transcript line's `timestamp`.
 
-Order is the order in which the service applies events: spool line order within one file. Field names belong to kingkai, not to Claude Code.
+Events are applied in spool line order. Field names belong to kingkai, not to Claude Code.
 
 ```
-SessionStarted(transcript_path, cwd, source, model, tmux_pane)   # tmux_pane from _kk.pane
-TurnStarted(kind, prompt_preview)      TurnStopped()   # kind: user | system ("<task-notification>" prompts)
-ToolCallStarted(agent, tool_use_id, tool, input_fingerprint, touches)
+SessionStarted(transcript_path, cwd, source, model, tmux_pane)
+TurnStarted(kind: "user" | "system", prompt_preview)      TurnStopped()
+ToolCallStarted(agent, agent_type, tool_use_id, tool, summary, input_fingerprint, touches)
 ToolCallSucceeded(agent, tool_use_id, duration_ms)
 ToolCallFailed(agent, tool_use_id, error_summary, interrupted)
-SubagentStarted(agent_id, agent_type)  SubagentStopped(agent_id, transcript_path)
-AttentionRequested(agent, tool)  # from PermissionRequest
+SubagentStarted(agent_id, agent_type)
+SubagentStopped(agent_id, agent_type: str | None, transcript_path)
+AttentionRequested(agent, tool)                             # from PermissionRequest
 Compacted(trigger)        SessionEnded(reason)
-UsageRecorded(agent, message_id, model, usage: TokenUsage)   # from the transcript
-Tick(session_id, now)     # synthetic, one per active session per second; never stored
+UsageRecorded(agent, message_id, model, usage: TokenUsage)  # from transcripts (Phase 2)
+Tick(now)                 ReplayCompleted()                 # synthetic (Phase 2); never in the spool
 ```
 
-- **`agent`.** `AgentRef = Main | Sub(agent_id)`.
-- **`input_fingerprint`.** The SHA-256 of the canonical JSON of the shrunk `tool_input`: keys sorted, compact separators. The repeated-call detector compares fingerprints, never raw input.
-- **`touches`.** A tuple of `FileTouch(path, kind: read|write|search)`, taken from `file_path` / `notebook_path` / `path` in `tool_input`:
+- **`agent`.** An `AgentRef`: `MainAgent()` or `SubAgent(agent_id)`.
+- **`summary`.** At most 60 characters for the timeline, built by the translator: `Bash` → `command`, `Agent` → `description`, `Grep`/`Glob` → `pattern`, otherwise the first touch path. A hashed value shows as `‹long input›`.
+- **`input_fingerprint`.** The SHA-256 of the canonical JSON of the shrunk `tool_input` (keys sorted, compact separators). Detectors compare fingerprints, never raw input.
+- **`touches`.** A tuple of `FileTouch(path, kind)`, where kind is `read`, `write` or `search`, built from `file_path`, `notebook_path` or `path` in `tool_input`:
   - read: `Read`
   - write: `Edit`, `MultiEdit`, `Write`, `NotebookEdit`
-  - search: `Glob`, `Grep`
-  - `Bash` is not parsed (§14).
+  - search: `Grep` with a `path`
+  - nothing for `Glob` or `Bash`.
 
 ### 4.3 Reducer rules
 
-- **Correlation by `tool_use_id`.** If a `Succeeded` or `Failed` arrives before its `Started` (possible with async hooks), the reducer records a "dangling end". The matching `Started` closes it when it arrives. The final state is the same in either order, and a property test checks this (§11.1).
-- **Idempotency.** An event whose `event_id` the reducer has already applied is a no-op. The state keeps a bounded set of seen ids (the last 10 000). Replay can then overlap with live tailing safely. `UsageRecorded` is additionally deduped by `message_id` (§4.5).
-- **Unknown agent.** A `ToolCallStarted` for an `agent_id` with no `SubagentStarted` creates the node implicitly, with `agent_type="unknown"`.
-- **Turn and typeability.**
-  - `TurnStarted` → `turn_open = True`. `TurnStopped` → `turn_open = False`.
-  - `AttentionRequested(agent, tool)` adds `agent` to `awaiting_permission: frozenset[AgentRef]`, and records when it happened.
-  - Only events from **that same agent** remove it: its next `ToolCallStarted`, `Succeeded` or `Failed`. A `TurnStopped` or `TurnStarted` clears the whole set. A parallel subagent's activity never clears the main agent's dialog flag.
-  - `Notification` (including `idle_prompt`) never blocks typing.
-  - A cancelled dialog (Esc) emits **no** event (Spike 0b). The flag would otherwise stay set until the next prompt, so §8.4 layer 3 can override a flag that is more than 1.5 s old once the screen shows no dialog.
-- **Abandoned calls.** A denied or cancelled tool call gets no `Succeeded` or `Failed`. On the next `TurnStarted`, and at `SessionEnded`, every call still `running` for that agent becomes `abandoned`.
-  - The reducer's flag is only **one of the layers** for S9. Hooks are async and polled, so it can lag. See §8.4 for the pane check done just before typing, and §16 Q-S9 for the residual risk.
+- **Correlation by `tool_use_id`.** An end that arrives before its start is kept as a call with `started_at=None`, and the start fills it in later. Either order gives the same call state.
+- **Idempotency.** An event whose `event_id` is in `state.seen: frozenset[EventId]` is a no-op, so replay can overlap with live tailing.
+- **Agents.**
+  - `SubagentStarted` creates a node.
+  - A `ToolCallStarted` for an unseen `SubAgent` creates the node from its `agent_type`.
+  - A `SubagentStopped` for an unseen agent whose `agent_type` is missing or empty is an auxiliary agent, and is ignored.
+- **Turns.**
+  - `TurnStarted` → `turn_open = True`.
+  - `TurnStopped` → `turn_open = False`.
+- **Abandoned calls.** A denied or cancelled tool call gets no end event. On the next `TurnStarted`, and at `SessionEnded`, every call still `running` becomes `abandoned`.
+- **Dialog flag.**
+  - `AttentionRequested(agent, …)` sets `awaiting_permission[agent] = at`.
+  - The entry is removed only by a later `ToolCallStarted`, `Succeeded` or `Failed` from **that same agent**, or by any `TurnStarted` or `TurnStopped`.
+  - Activity from another agent never clears it.
+  - The flag is one input to S9; §8.4 says how `ReferenceService` uses it.
+- **Liveness.** `SessionEnded` sets `ended = True`. "Idle" is not stored: presenters derive it from `last_activity` (more than 30 min ago).
 
-### 4.4 Alert detectors (Strategy)
+### 4.4 Alert detectors (Strategy, Phase 2)
 
-Each detector is `(state_before, event, now) -> AlertChanges`, which holds the alerts to raise and the keys to clear. An alert has a stable `key` (for example `repeated:<agent>:<fp>`), so it is raised once and then updated, never duplicated. It also **clears** when its condition no longer holds.
-- "Activity" means a **hook event** for that session. `Tick` and `UsageRecorded` don't count.
-- During replay, `now` is the event's own `at`. Time-based detectors stay off until the service emits `ReplayCompleted`, so a restart doesn't raise stale stall alerts.
+Each detector is `(before: SessionState, event, now) -> AlertChanges`, holding the alerts to raise and the keys to clear.
+- **Keys.** Alerts have stable keys (for example `repeated:<agent>:<fp>`). They are raised once, then updated, and cleared when their condition no longer holds.
+- **Activity** means a hook event for the session. `Tick` and `UsageRecorded` don't count.
+- **Replay.** During replay `now` is the event's `at`, and the time-based detectors stay off until `ReplayCompleted`.
+- **Thresholds** are constructor arguments with these constant defaults. They aren't user-configurable in the MVP.
 
-| Detector | Fires when | Clears when | Default (`kingkai.toml`) | Severity |
+| Detector | Fires when | Clears when | Default | Severity |
 |---|---|---|---|---|
-| `RepeatedCall` | The same `(agent, tool, input_fingerprint)` appears ≥ N times among that agent's last K tool calls | That fingerprint is in fewer than N of the last K calls | N = 3, K = 10 | warning |
-| `ToolFailure` | Any `ToolCallFailed` that isn't an interrupt | Expires 60 s later (informational) | n/a | info |
-| `RetryLoop` | ≥ M consecutive failures of the same `(agent, tool)` | The same `(agent, tool)` succeeds | M = 3 | error |
-| `Stall` | A turn is open, no agent is awaiting permission, and there has been no activity for T seconds. While a tool call is in flight, the threshold is T_tool instead (checked on `Tick`). | The next activity | T = 120 s, T_tool = 600 s | warning |
+| `RepeatedCall` | The same `(agent, tool, fingerprint)` appears ≥ N times in that agent's last K calls | It appears fewer than N times in the last K | N = 3, K = 10 | warning |
+| `ToolFailure` | A `ToolCallFailed` that isn't an interrupt | 60 s later | — | info |
+| `RetryLoop` | ≥ M consecutive failures of the same `(agent, tool)` | That `(agent, tool)` succeeds | M = 3 | error |
+| `Stall` | A turn is open, no dialog flag is set, and there has been no activity for T. Checked on `Tick`. | The next activity | T = 120 s, or 600 s while a call is running | warning |
 
-The plan's verification criterion ("the same command failing 3 times raises an alert") is covered by both `RetryLoop` and `RepeatedCall`.
+### 4.5 Usage and cost (Phase 2)
 
-### 4.5 Usage and cost
-
-- **Where usage comes from.** `UsageRecorded` events come only from the transcript, because hooks carry no token data. The tailer reads only `type == "assistant"` lines that have `message.usage`. It keeps `message.id`, `message.model`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`.
-- **Dedupe.** A streamed message may repeat its usage across several lines. The reducer keeps the **last** usage per `message_id`. Usage is keyed by `message_id` across *all* files of a session, so if a subagent's usage also shows up in the main transcript, it is counted once.
-
-  Spike 0b confirmed that repeated usage is **cumulative**, so the last value wins. It also confirmed that subagent usage appears only in the subagent's own file.
-- **Subagent usage.** Read from the `agent_transcript_path` that `SubagentStop` reports. While a subagent is still running, the tailer also watches `<session>/subagents/agent-*.jsonl`. The file name is `agent-<agent_id>.jsonl` (confirmed). Auxiliary agents have no transcript, so their usage (small amounts, e.g. Haiku) is not counted, and the UI help says so.
-- **Cost.**
-  - The estimate is `Σ tokens × price` from `assets/pricing.toml` (USD per million tokens, for each model and each of 5 token kinds: input, output, cache write 5 m, cache write 1 h, cache read). Cache writes are split using `usage.cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.. Users can override it in `kingkai.toml`.
-  - The UI always labels it **"≈ API-equivalent"**. It isn't a bill: subscription plans aren't billed per token.
-  - If the model has no price, tokens are shown and cost shows `—`. kingkai never guesses a price.
-  - **Claude Code's own figure.** When the transcript has a `cost-state` line (internal format; written near the end of a session), kingkai shows its `totalCostUSD` beside the estimate as "Claude Code's estimate". It is optional: parsing failures are ignored.
-- **OpenTelemetry.** Claude Code's OTel export is a documented alternative that includes `cost_usd` and `query_source`. It is out of scope for the MVP (§14): it only works for sessions started with OTel env vars, and it would need an OTLP receiver. The `EventSource` port leaves room for it.
+- **Source.** `UsageRecorded` comes only from transcripts: `type == "assistant"` lines that have `message.usage`.
+- **Files.** The main file is `transcript_path`. Subagent files are `<session>/subagents/agent-<agent_id>.jsonl`. They are watched while the subagent runs, and `SubagentStop` gives the path.
+- **Dedupe.** Lines that share a `message.id` repeat usage cumulatively, so the **last** one wins. Usage is keyed by `message_id` across all of a session's files.
+- **`TokenUsage` fields:**
+  - `input` and `output`;
+  - `cache_write_5m` and `cache_write_1h`, from `usage.cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`;
+  - `cache_read`.
+- **Cost estimate.** `Σ tokens × price`, using `assets/pricing.toml` (USD per million tokens, per model, for the 5 kinds), with overrides from `kingkai.toml`.
+  - It is always labelled **"≈ API-equivalent"**: subscription plans aren't billed per token.
+  - If the model has no price, the cost shows `—`. kingkai never guesses.
+- **Claude Code's own estimate.** If a transcript has a `cost-state` line (an internal format, written near the end of a session), its `totalCostUSD` is shown beside the estimate as "Claude Code's estimate". A parse failure just hides it.
+- **Not counted.** Auxiliary agents have no transcript, so their usage (small amounts) isn't counted, and the help screen says so.
+- **OpenTelemetry** is out of scope (§14). The `EventSource` port leaves room for it.
 
 ---
 
@@ -338,58 +323,56 @@ The plan's verification criterion ("the same command failing 3 times raises an a
 
 ### 5.1 Hook client (`kingkai-hook`)
 
-The hook client is a separate console script. It imports only the stdlib, and an import-linter contract checks that.
-
-1. It reads all of stdin. There is no size cap, because shrinking happens before anything is written.
-2. It parses the JSON. If that fails, it exits 0.
-3. **Shrink** (`shrink.py`, a pure function, applied recursively to the whole payload):
-   - These display fields are **cut** to a preview: `prompt` to 80 characters; `error`, `message` and `last_assistant_message` to 200.
-   - Any other string longer than 512 characters becomes `{"$sha256": <hex>, "$len": <n>}`. This keeps the spool small (a `Read` response can carry a whole file) and keeps fingerprints exact.
-   - Afterwards, every string in the line is ≤ 512 characters.
-4. It adds `"_kk": {"v": 1, "id": <uuid4 hex>, "at": <iso8601 UTC>, "pane": $TMUX_PANE or null}`.
-5. It appends one line to the spool file, under an exclusive `fcntl.flock`, with mode 0600.
-6. It **always exits 0 and never writes to stdout or stderr**. Every exception is caught and dropped.
+1. It reads all of stdin and parses the JSON. If that fails, it exits 0 with no output.
+2. **Shrink** (`shrink.py`, pure):
+   - Top-level display fields are **cut**: `prompt` to 80 characters; `error` and `last_assistant_message` to 200.
+   - Then, recursively, any string longer than 512 characters anywhere becomes `{"$sha256": <hex>, "$len": <n>}`.
+   - The cut list applies to top-level keys only, so `tool_input.prompt` (for example on `Agent` calls) is hashed, not cut. That keeps fingerprints exact.
+3. **Envelope** (`envelope.py`, pure): `envelope(payload, *, event_id, at, pane)` adds `"_kk": {"v": 1, "id": <uuid4 hex>, "at": <iso8601 UTC>, "pane": $TMUX_PANE or null}`.
+4. **Append** one line to the spool, under an exclusive `fcntl.flock`, with file mode 0600.
+5. It **always exits 0 and writes nothing to stdout or stderr** (S10).
 
 **Spool location.** `<state>/spool/<project-key>/<session_id>.ndjson`:
-- `<state>` is `$XDG_STATE_HOME/kingkai`, falling back to `~/.local/state/kingkai`. Directories are created with mode 0700.
-- `<project-key>` is the first 16 hex characters of `sha256(realpath(CLAUDE_PROJECT_DIR or cwd))`. Claude Code sets `CLAUDE_PROJECT_DIR` for hook processes (hooks docs, "path placeholders").
-- `session_id` is checked against `^[A-Za-z0-9-]{1,64}$` before it is used in a path. If the check fails, the payload is dropped.
-- Retention: spool files older than 7 days are deleted when `kingkai watch` starts. The spool can contain prompt previews and tool inputs, so it stays under the user's state dir with 0600/0700 permissions.
+- `<state>` is `$XDG_STATE_HOME/kingkai`, falling back to `~/.local/state/kingkai`. Directories have mode 0700.
+- `<project-key>` is the first 16 hex characters of `sha256(realpath(CLAUDE_PROJECT_DIR or payload cwd))`.
+- `session_id` must match `^[A-Za-z0-9-]{1,64}$`; otherwise the payload is dropped.
+- `watch` deletes spool files older than 7 days when it starts.
 
-### 5.2 Tailing
+### 5.2 Tailing and sessions
 
-- `NdjsonTailer(path, poll_interval, clock)` yields complete lines only. It keeps a partial trailing line until it gets its `\n`. If the file shrinks or its inode changes, the tailer starts again from offset 0.
-- It polls (default 100 ms for spools, 500 ms for transcripts) and uses `asyncio.sleep` with an injected interval, so tests run with zero sleep.
-- **Decision (my call):** polling instead of inotify/watchfiles. There is one less dependency, behaviour is the same on WSL, macOS and Linux, tests are deterministic, and the latency is good enough.
-- **Discovery.** `SpoolDirectory` scans the project's spool dir every second. It tails every `*.ndjson` modified in the last 24 h, plus any new file that appears, each from offset 0. Each spool also starts a `TranscriptTailer` for the `transcript_path` its `SessionStarted` gives. Thanks to reducer idempotency (§4.3), replay followed by live tailing is safe. Once every file has been read to EOF on startup, the service emits `ReplayCompleted`.
-- **Session liveness.** A session is `live` from `SessionStarted` until `SessionEnded`, or until 30 minutes pass with no activity, when it becomes `idle`. A session that crashed without a `SessionEnd` then shows as idle, not live forever. The switcher lists live sessions first. The default is the newest session bound to `--pane` (§8.4), or else the newest live one.
-- **Project root.** `watch`, `init` and `up` walk up from the cwd to the nearest directory containing `.claude/` or `.git/`. `--root` overrides this. `doctor` warns when the spool's `CLAUDE_PROJECT_DIR`-based key differs from the resolved root.
+- **`NdjsonTailer(path, *, poll_interval, sleep, chunk_size=65536)`.**
+  - It yields complete lines only, as `TailedLine(path, offset, data)`.
+  - It reads in bounded chunks and awaits `sleep(0)` between chunks, so a large replay never blocks the loop.
+  - It restarts from offset 0 if the file shrinks or its inode changes.
+  - It polls: every 100 ms for spools and 500 ms for transcripts. There is no inotify: polling is one less dependency, behaves the same on WSL, macOS and Linux, and tests stay deterministic.
+- **`SpoolDirectory`.** It scans the project's spool dir every second and tails each `*.ndjson` file modified in the last 24 h, from offset 0. It reports undecodable lines through an injected `on_skip(reason)` callback, which feeds `Diagnostics`.
+- **`ReplayCompleted`** is emitted once every file has been read to EOF at startup.
+- **Which session is shown:**
+  - With `--pane`, the newest session whose `tmux_pane` matches; otherwise the newest session.
+  - The view auto-follows newer sessions until the user presses `s`, which cycles through sessions.
+- **Project root.** `find_project_root(start, home)` walks up from the cwd to the nearest directory containing `.git/` or `.claude/`. It **stops below `home`**, because `~/.claude` is user config, not a project. If it finds nothing, it uses the cwd. `--root` overrides all of this. `doctor` warns if the spool keys found don't match the resolved root.
 
 ### 5.3 Daemon to TUI
 
-Both run in one process and one asyncio loop.
-
-- `Store` keeps `dict[SessionId, SessionState]` and a list of subscriber callbacks.
-- `SessionService.run()` drains the `EventSource`s. For each event it runs `reduce` and the detectors, and puts the new state in the store.
-- The Textual app subscribes. Its callback coalesces changes to **at most 10 Hz**, keeping only the latest snapshot, and calls `app.post_message(SnapshotUpdated(snapshot))`. Widgets update from presenters.
-- A `Tick` event goes into the service every second for the time-based detectors.
-- Background tasks run as Textual `@work` async workers (`exclusive=True`, with a group per task). The servers are started in `on_mount` and stopped in `on_unmount`.
-- The aiohttp ingress uses `AppRunner` plus `TCPSite`, which doesn't touch signal handlers. uvicorn does replace them, which is why it isn't used.
-- **Splitting later:** if the TUI and daemon ever need to be separate processes, `Store` subscriptions become a stream over a Unix socket. Nothing in `domain` or `application` would change.
+- `Store` keeps `dict[SessionId, SessionState]` and its subscribers, plus `Diagnostics`, the one deliberate piece of mutable application state: skipped-line counts per reason.
+- `SessionService.run()` drains the `EventSource`s, applies `reduce` (and the detectors, from Phase 2) and puts the new state in the store.
+- The Textual app subscribes with a callback that sets a **dirty flag**. A `set_interval(0.1)` timer re-renders the shown session from presenters when the flag is set. That gives at most 10 renders per second, with no message queue to manage.
+- Background work runs as Textual `@work` async workers, and the supervisor wraps each one (§10). The aiohttp server uses `AppRunner` plus `TCPSite`, which leaves signal handlers alone.
+- **Splitting later:** the `Store` subscription would become a stream over a Unix socket. `domain` and `application` wouldn't change.
 
 ---
 
 ## 6. CLI
 
-`cyclopts` builds the CLI. Every command can be called in tests as a function with an argv list.
+`cyclopts` builds the CLI. Every command can be called in tests with an argv list.
 
 | Command | What it does |
 |---|---|
-| `kingkai init [--next] [--django]` | Installs the hooks in `.claude/settings.local.json` (with a diff preview; `--yes` skips it). It creates `.kingkai/` with its own `.gitignore` containing `*`, so the user's `.gitignore` is never edited. With `--next` / `--django` it prints the integration snippet (§8.2, §8.3); it never edits app code. |
-| `kingkai uninstall` | Removes kingkai's hook entries and `.kingkai/`. |
-| `kingkai up` | Creates or attaches the tmux session `kingkai-<dir>`: `claude` on the left, `kingkai watch --pane <%id>` on the right. The Claude pane id is recorded at creation time. |
-| `kingkai watch [--pane %N]` | Starts the TUI and the services. Without `--pane` (outside `up`), references go to the clipboard. |
-| `kingkai doctor` | Checks Python, tmux (≥ 3.2), installed hooks, the spool dir and its permissions, a clipboard backend, and the session file. It explains any failure in one line. |
+| `kingkai init [--yes] [--next] [--django] [--root P]` | Installs the hooks, writes the shim, and creates `.kingkai/` with its own `.gitignore` containing `*`. It shows a diff first unless `--yes` is given. Invalid JSON in the existing `settings.local.json` aborts with exit code 2 and writes nothing. `--next` / `--django` print the integration snippet; `init` never edits app code. |
+| `kingkai uninstall [--root P]` | Removes kingkai's hook entries and `.kingkai/`. |
+| `kingkai up [--root P]` | Creates or attaches the tmux session `kingkai-<dir>`: `claude` on the left, `kingkai watch --pane <%id>` on the right. The Claude pane starts with the parent's Claude Code session variables removed (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`); otherwise they leak into child processes. |
+| `kingkai watch [--pane %N] [--root P]` | Starts the TUI and the services. Without `--pane`, references go to the clipboard. |
+| `kingkai doctor` | Checks Python, tmux (≥ 3.2), the hooks, the shim, the spool dir and its modes, a clipboard backend, and the session file. It explains each failure in one line. |
 
 ### 6.1 TUI layout and key bindings
 
@@ -397,7 +380,7 @@ Both run in one process and one asyncio loop.
 ┌ kingkai · myapp · session 3f2a… (live) ───────────────────── ≈ $0.42 · 81k tok ┐
 │ Agents                     │ Timeline                                          │
 │ ▼ main  ● working          │ 10:02:11 main  Read   src/app/page.tsx       12ms │
-│   ├ Explore  ✓ done        │ 10:02:12 sub1  Grep   "useAuth"              40ms │
+│   ├ Explore  ✓ done        │ 10:02:12 sub1  Grep   src/lib                40ms │
 │   └ general  ● working     │ 10:02:15 main  Bash   ✗ exit 1               2.1s │
 ├────────────────────────────┼───────────────────────────────────────────────────┤
 │ Files                      │ Alerts                                            │
@@ -405,38 +388,39 @@ Both run in one process and one asyncio loop.
 │ R src/lib/auth.ts       1  │ ⚠ Stall      no activity for 2m (turn open)       │
 ├────────────────────────────┴───────────────────────────────────────────────────┤
 │ Last reference: @src/components/Button.tsx#L42  → typed (tmux %3) · Button      │
-└ s sessions  a agent filter  f files: all/written  c clear alerts  ? help  q quit ┘
+└ s next session  a agent filter  f written only  c clear alerts  y copy  ? help  q quit ┘
 ```
 
 | Key | Action |
 |---|---|
-| `s` | Session switcher (modal list) |
+| `s` | Show the next session (and stop auto-following) |
 | `a` | Filter the timeline and files by the agent selected in the tree (toggle) |
-| `f` | Files panel: show all touches, or written files only |
-| `c` | Dismiss the current alerts. They come back if their condition fires again. |
-| `y` | Copy the last reference to the clipboard (the manual fallback) |
-| `?` | Help screen |
+| `f` | Files panel: all touches, or written files only |
+| `c` | Dismiss the current alerts; they come back if their condition fires again |
+| `y` | Copy the last reference to the clipboard |
+| `?` | Help |
 | `q` / `ctrl+q` | Quit |
 
-Below 100 columns, the layout collapses to tabs (`1`–`4` switch panels). Snapshot tests cover 120×40 and 80×24.
+- **Narrow terminals.** Below 100 columns the layout collapses to tabs, and `1`–`4` switch panels (Phase 2).
+- **No markup in data.** Every string that comes from data (paths, labels, prompt previews, errors) is rendered as a Rich `Text`, never parsed as markup. `app/[slug]/page.tsx` must display literally (S12).
 
 ---
 
 ## 7. Configuration
 
-`kingkai.toml` sits at the project root, is optional, and is parsed into a frozen `Config`. Unknown keys are an error: a typo should not be silently ignored.
+`kingkai.toml` sits at the project root and is optional. It is parsed into a frozen `Config`, and unknown keys are an error. The MVP has two settings:
 
 ```toml
 [references]
-format = "#L"                     # "#L" | ":"
 allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000",
-                   "http://localhost:8000", "http://127.0.0.1:8000"]
-[alerts]
-repeated_call = { threshold = 3, window = 10 }
-retry_loop = { threshold = 3 }
-stall_seconds = 120
-[pricing."claude-opus-5-5"]       # optional overrides, USD per MTok
-input = 0.0                        # (example key shape only)
+                   "http://localhost:8000", "http://127.0.0.1:8000"]   # the default
+
+[pricing."claude-opus-5-5"]        # optional; USD per million tokens
+input = 0.0
+output = 0.0
+cache_write_5m = 0.0
+cache_write_1h = 0.0
+cache_read = 0.0
 ```
 
 ---
@@ -445,193 +429,176 @@ input = 0.0                        # (example key shape only)
 
 ### 8.1 Overlay protocol
 
-The browser overlay is TypeScript in `overlay/`. esbuild bundles it into one IIFE (`assets/overlay.js`), and it renders inside a closed shadow root so it shares no CSS with the app.
+The overlay is written in TypeScript in `overlay/`. esbuild bundles it into one IIFE, `assets/overlay.js`, and it renders inside a closed shadow root so it shares no CSS with the app.
 
-**Bootstrap.** The page includes `<script src="{url}/overlay.js" data-kingkai-url="{url}" data-kingkai-token="{token}" defer>`. The tag is **rendered server-side** by the framework integration, which reads `.kingkai/session.json`. The overlay itself is static and holds no secret. Any site may load `overlay.js`, and gains nothing from it: the token lives only in the dev app's own HTML, which other origins can't read (same-origin policy).
+**Bootstrap.**
+- The page includes `<script src="{url}/overlay.js" data-kingkai-url data-kingkai-token data-kingkai-app-root defer>`. The framework integration renders this tag **server-side** from `.kingkai/session.json`.
+- `overlay.js` is static and holds no secret. Any site can load it and gains nothing: the token lives only in the dev app's own HTML, which other origins can't read.
 
-**Session file.** `.kingkai/session.json` is created with mode 0600 and deleted on a clean exit. If its pid is gone, it is stale and gets overwritten.
+**Session file.** `.kingkai/session.json` has mode 0600. It is deleted on a clean exit, and a file whose pid is dead is stale.
 
 ```json
-{ "v": 1, "url": "http://127.0.0.1:53817", "token": "<43 chars, secrets.token_urlsafe(32)>",
-  "root": "/home/<user>/dev/myapp", "pid": 4242, "started_at": "2026-10-19T10:00:00Z" }
+{ "v": 1, "url": "http://127.0.0.1:53817", "token": "<secrets.token_urlsafe(32)>",
+  "root": "/home/user/dev/myapp", "pid": 4242, "started_at": "2026-10-19T10:00:00Z" }
 ```
 
-The port is ephemeral (bound to `127.0.0.1:0`). That's possible because the integrations read the URL from this file, and it avoids port conflicts.
-
-**Integrations read the session file on each request.** They cache it by mtime and inject **nothing** when the file is missing or its pid is dead. When kingkai restarts, the port and token change. If the overlay's POST fails to connect or gets `403 token`, the overlay shows "kingkai restarted, reload the page".
-
-**Paths.** Integrations send **absolute** file paths. Django's loader writes `origin.name`, and the React method is normalized to absolute in the overlay where possible. Python is the only place paths are made relative, against `root`. That keeps monorepos and Django `BASE_DIR` layouts unambiguous.
+- **The port is ephemeral** (bound to `127.0.0.1:0`). The integrations read the URL from this file.
+- **Integrations re-read the file on each request,** cached by mtime. They inject **nothing** when it's missing or stale.
+- **After a kingkai restart,** the port and token change. If the overlay's POST can't connect or gets `403 bad_token`, it shows "kingkai restarted, reload the page".
 
 **Interaction.**
-- Holding Alt highlights the element under the pointer and shows a label (`Button.tsx:42`).
-- Alt+click is captured in the **capture phase** with `preventDefault()` and `stopPropagation()`, so the app's handlers and the browser's Alt+click download are suppressed.
+- Holding Alt highlights the element under the pointer and shows a label.
+- Alt+click is captured in the capture phase with `preventDefault()` and `stopPropagation()`.
 - Esc cancels.
-- The result shows as a toast: "typed into Claude Code", "copied to clipboard" or "rejected: <reason>".
+- A toast reports the result: "typed into Claude Code", "copied to clipboard", "couldn't locate source", or "rejected: <reason>".
 
-**HTTP API (v1).** Only these routes exist; every other path returns 404.
+**HTTP API (v1).** These are the only routes; anything else returns 404.
 
-| Route | Auth | Purpose |
+| Route | Checks | Purpose |
 |---|---|---|
-| `GET /overlay.js` | Host check only | Static asset, `Cache-Control: no-store` |
-| `OPTIONS /v1/references` | Host and Origin | CORS preflight. Only allowlisted origins get `Access-Control-Allow-Origin: <exact origin>`, plus `Allow-Headers: content-type, x-kingkai-token`, `Allow-Methods: POST` and `Vary: Origin` |
-| `POST /v1/references` | Host, Origin, token, content type, size | Submit a click |
+| `GET /overlay.js` | Host | Static asset, `Cache-Control: no-store` |
+| `OPTIONS /v1/references` | Host and Origin | CORS preflight. Only allowlisted origins get `Access-Control-Allow-Origin: <that origin>`, plus `Allow-Headers: content-type, x-kingkai-token`, `Allow-Methods: POST` and `Vary: Origin` |
+| `POST /v1/references` | Host, Origin, content type, size, token, rate | Submit a click |
 
-Request body (≤ 4 KiB, `Content-Type: application/json`):
+Request body (≤ 4096 bytes, `Content-Type: application/json`):
 
 ```json
-{ "v": 1,
-  "kind": "react",
+{ "v": 1, "kind": "react",
   "candidates": [
-    { "file": "file:///home/user/dev/myapp/node_modules/next/dist/client/app-dir/link.js", "line": 787, "column": 3 },
-    { "file": "file:///home/user/dev/myapp/src/components/ui/Button.tsx", "line": 5, "column": 5 } ],
-  "label": "Button",                 "selector": "main > div:nth-child(2) > button",
-  "page": "http://localhost:3000/settings" }
+    { "file": "file:///home/user/dev/myapp/node_modules/next/dist/client/app-dir/link.js", "line": 787 },
+    { "file": "file:///home/user/dev/myapp/src/components/ui/Button.tsx", "line": 5 } ],
+  "label": "Button", "selector": "main > div:nth-child(2) > button",
+  "page": "http://localhost:3000/settings", "view": null }
 ```
 
-- `kind` is `react` or `django`.
-- `candidates` lists 1–10 owner-stack frames, innermost first. Django sends exactly one.
-- Python checks each candidate with `parse_reference` and **uses the first that passes**: the first frame inside the project that is a real file. This keeps every containment decision in Python (S4), so the overlay never needs to know the root. If none passes, the reason given is the one for the first candidate.
-- `candidates[].file` is either an absolute `file://` URL or an absolute POSIX path. Python accepts nothing else; any other scheme is `bad_scheme`.
-  - The overlay resolves every raw React frame URL itself: `http(s)://…/_next/static/chunks/…` and `about://React/<Env>/…` (Spike 0a).
-  - Paths that Next's endpoint returns relative to the Next.js app root are made absolute using `data-kingkai-app-root`.
-- `label`, `selector`, `page` and `view` (Django's `kingkai-view` meta, shown next to the reference) are **only displayed in the TUI**. They are never typed, and before display they are **stripped** of control characters and cut to 120 characters. A `candidates[]` entry that contains any is **rejected** (S6).
+- **`kind`** is `react` or `django`; anything else gets `422 bad_kind`.
+- **`candidates`** has 1–10 entries, innermost frame first; anything else gets `422 bad_candidates`. Django sends exactly one.
+- **Choosing a candidate.** Python runs `parse_reference` on each candidate in order, and **the first accepted one wins**. Every containment decision therefore stays in Python. If none is accepted, the response gives the first candidate's reason.
+- **`candidates[].file`** must be an absolute `file://` URL or an absolute POSIX path of at most 1024 characters. The overlay resolves every raw React frame URL before sending (§8.2).
+- **`label`, `selector`, `page` and `view`** are display-only. They are never typed. Control characters are **stripped** from them and they are cut to 120 characters. Control characters inside a candidate cause a **rejection** instead (S6).
 
 Responses:
-- `200 {"status": "typed" | "copied" | "shown", "text": "@src/components/Button.tsx#L42 "}`. Delivery finishes before the response is sent.
-- `400` / `403` / `413` / `415` / `422` / `429 {"error": "<code>"}`, where `<code>` is a `RejectionReason` or a guard code.
+- `200 {"status": "typed" | "copied" | "shown", "text": "@src/components/ui/Button.tsx#L5 "}`, sent after delivery finishes.
+- On error, `{"error": <code>}` with the code as a `RejectionReason` or guard code: `400` (bad JSON), `403` (host, origin or token), `413` (size), `415` (content type), `422` (rejected) or `429` (rate).
 
-### 8.2 React 19 / Next.js 16: where the source location comes from (decided by Spike 0a)
+### 8.2 React 19 / Next.js 16: source location (runtime owner stack)
 
-React 19 removed `_debugSource` and the `__source` JSX prop (react#28265). Spike 0a (`docs/spikes/0a-react-source.md`) tested a build-time attribute (code-inspector-plugin) against a runtime owner stack.
+React 19 removed `_debugSource`. The overlay resolves an element like this:
+1. **Fiber.** Take the element, or its `parentElement` for a text node, and read its React fiber from the `__reactFiber$*` key.
+2. **Owner stack.** Use `getSource(fiber, false)` and `getOwnerStack` from `bippy/source`. The `false` disables bippy's source-map cache, which hot reload (HMR) needs. bippy is pinned exactly in `overlay/package.json` and bundled into `overlay.js`.
+3. **Server frames.** A frame like `about://React/<Env>/…` is resolved with a same-origin `POST /__nextjs_original-stack-frames`, which uses the fields `line1` and `column1`. The response paths are relative to the Next.js app root, so they are made absolute with `data-kingkai-app-root`.
+4. **Send.** Up to 10 resolved frames go out as `candidates`.
 
-**Decision: runtime owner stack only.** The build-time attribute gave the *call site* for every component root, including `.map` items and imported components. It also needs config, opens an IDE server on all interfaces, and its hotkey clashes with ours.
+If nothing resolves, the toast says "couldn't locate source". The overlay never guesses.
 
-How the overlay resolves an element:
-1. **Fiber.** Take the element, or its `parentElement` for a text node. Its React fiber is under the `__reactFiber$*` key.
-2. **Owner stack.** bippy's `getOwnerStack` / `getSource(fiber, false)`. The `false` disables bippy's source-map cache, which is needed for HMR. `bippy` is pinned to an exact version in `overlay/package.json` and bundled into `overlay.js`.
-3. **Server frames.** Frames like `about://React/<Env>/…` are resolved with `POST /__nextjs_original-stack-frames`, a same-origin request from the page to Next's dev server. Its fields are `line1`/`column1`. It returns paths relative to the Next.js app root, which the overlay makes absolute with `data-kingkai-app-root`.
-4. **Send.** Up to 10 resolved frames go to the daemon as `candidates`. Python picks the first one inside the project (§8.1).
+- **Accepted fragility:** React internals, a private Next.js dev endpoint, and bippy. The e2e suite runs the four spike cases on `examples/next-demo`, so a breaking upgrade fails CI.
+- **Next integration:** `kingkai init --next` prints a dev-only server-component snippet, about 15 lines, for the root layout. It reads the session file and renders the script tag, with `data-kingkai-app-root={process.cwd()}`. No `next.config.ts` change is needed, and there's no npm package in the MVP.
 
-If no fiber is found or nothing resolves, the overlay shows "couldn't locate source". It never guesses.
+### 8.3 Django: DEBUG-only template loader (Phase 4)
 
-**Fragility we accept:** this depends on React internals, a private Next.js dev endpoint, and bippy. The e2e suite (§11.5) runs the four spike cases on `examples/next-demo` (client component, server component, `.map` item, imported `ui/` component), so a breaking upgrade fails CI.
-
-**Next.js integration in the MVP:**
-- `kingkai init --next` prints a dev-only server component snippet, about 15 lines, for the root layout.
-- The snippet reads `.kingkai/session.json` and renders the script tag with `data-kingkai-url`, `data-kingkai-token` and `data-kingkai-app-root={process.cwd()}`.
-- No `next.config.ts` change is needed.
-- **Decision (my call):** no npm package in the MVP. A snippet is easy to audit, and publishing to npm is v2.
-
-### 8.3 Django: DEBUG-only template loader (open questions → Phase 3 spike)
-
-- **Loader.** `SourceAnnotatingLoader` subclasses `django.template.loaders.filesystem.Loader`, with a second variant for `app_directories.Loader`, so that `Origin.loader is self`, which `cached.Loader` needs.
-  - `get_contents(origin)` tokenizes the source with `django.template.base.Lexer`. Only in **TEXT** tokens, it inserts ` data-src="<relpath>:<line>"` right after each opening `<tagname`. It skips `<!doctype`, comments, closing tags, and the bodies of `<script>` and `<style>`.
-  - It never adds newlines, so line numbers in debug pages stay correct.
-  - It only runs on `.html` and `.htm` templates, and is a no-op unless `settings.DEBUG` is true.
-- **Middleware.** `KingkaiMiddleware` (DEBUG only, `text/html` responses only):
-  - injects the overlay script tag before `</body>`;
-  - adds `<meta name="kingkai-view" content="<relpath>:<line>">`, using `request.resolver_match.func` (or `.view_class` for class-based views) and `inspect.getsourcelines`.
-- **Open questions for the Phase 3 spike:**
-  1. Should the source be rewritten in `get_contents`, or should the compiled nodelist's `TextNode`s be patched afterwards? Patching would leave `Template.source` untouched in debug pages.
-  2. What exactly happens with `{% include %}`, `{% extends %}` and `{% block %}` (expected: each element maps to the file it appears in).
-  3. Do tags whose name is built by template logic (`<{{ tag }}>`) fail safely?
-  4. Does it behave correctly with `django-debug-toolbar` installed?
-  5. Is Jinja2 support via `Extension.preprocess` cheap enough for the MVP? (Default: no, it goes to v2.)
+- **Loader.** `SourceAnnotatingLoader` subclasses `filesystem.Loader`, with an `app_directories.Loader` variant, so that `Origin.loader is self` (required by `cached.Loader`).
+  - In TEXT tokens from `django.template.base.Lexer`, it inserts ` data-src="<absolute path>:<line>"` right after each opening `<tagname`.
+  - It skips `<!doctype`, comments, closing tags, and the bodies of `<script>` and `<style>`.
+  - It never adds newlines.
+  - It only handles `.html`/`.htm` files, and only when `settings.DEBUG` is true.
+- **Middleware.** `KingkaiMiddleware` (DEBUG only, `text/html` only):
+  - injects the script tag before `</body>`;
+  - adds `<meta name="kingkai-view" content="<absolute path>:<line>">`, built from `request.resolver_match` and `inspect.getsourcelines`. The overlay sends it as `view`.
+- **Open question Q9** (mini-spike at the start of Phase 4):
+  - Should the source be rewritten in `get_contents`, or the compiled nodelist patched instead?
+  - How do `{% include %}`, `{% extends %}` and `{% block %}` map?
+  - Do tag names built by template logic fail safely?
+  - Does it work alongside django-debug-toolbar?
+  - Default if unresolved: rewrite in `get_contents`. Jinja2 is v2.
 
 ### 8.4 The typed reference: grammar and delivery
 
 **Grammar.** This is the only text kingkai ever types:
 
 ```
-typed   = "@" path sep line " "
-path    = segment *( "/" segment )          ; relative to the project root, POSIX separators
-segment = Python regex [\w.\-()\[\]@+]+ with re.UNICODE \w (letters, digits, "_")
-          ; "." and ".." are not allowed as a whole segment
-sep     = "#L" / ":"                        ; ReferenceFormat; chosen once per config
-line    = [1-9][0-9]*                       ; 1 ≤ line ≤ number of lines in the file
+^@(?:[\w.\-()\[\]@+]+/)*[\w.\-()\[\]@+]+#L[1-9][0-9]* $        (re.UNICODE \w)
 ```
 
-The whole-string regex is `^@(?:[\w.\-()\[\]@+]+/)*[\w.\-()\[\]@+]+(?:#L|:)[1-9][0-9]* $`, plus a check on `.` and `..` segments. The rendered path is the **resolved filesystem name** made relative to the root, so the user can't choose its spelling. It is NFC-normalized before matching against the grammar.
+`parse_reference` also requires:
+- **Path shape.**
+  - The path is the **resolved filesystem name**, made relative to the root and NFC-normalized.
+  - No segment is `.` or `..`.
+  - No segment is `node_modules`, `.next`, `.git` or `.venv` (otherwise `excluded_dir`). Frames from inside the root's dependencies are skipped this way.
+- **Line.** `1 ≤ line ≤ line_count`.
+- **Allowed characters.**
+  - Next.js app-router paths such as `app/(marketing)/[slug]/page.tsx` are allowed.
+  - Spaces, `;`, `#`, `:`, quotes, backslashes, and every control or format character are rejected. Paths with spaces are not supported in the MVP.
 
-- Next.js app-router paths are allowed (`app/(marketing)/[slug]/page.tsx`).
-- Spaces, `;`, `#`, `:`, quotes, backslashes and every control or format character are rejected.
+**Delivery via tmux: bracketed paste.** Two commands run through `asyncio.create_subprocess_exec`, with no shell:
+1. `["tmux", "load-buffer", "-b", buf, "-"]`, with the rendered text on stdin;
+2. `["tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", pane]`.
 
-> **Decision (my call):** paths containing spaces are rejected in the MVP. Spike 0b checks whether Claude Code accepts a quoted mention.
-
-**Delivery via tmux: bracketed paste** (decided by Spike 0b for policy (a)). It runs two commands, both through `asyncio.create_subprocess_exec`, with no shell:
-1. `("tmux", "load-buffer", "-b", buf, "-")`, with `text` written to stdin;
-2. `("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", pane_id)`.
-
-- `buf` is `kingkai-<uuid4 hex>`, unique for each delivery.
-- `-p` wraps the text in bracketed-paste markers, so Claude Code receives a single paste event, and dialog digit hotkeys can't fire. Spike 0b showed that split `send-keys` keystrokes *can* fire them.
-- `-d` deletes the buffer afterwards.
+Details:
+- `buf` is `kingkai-<uuid4 hex>`.
+- `-p` sends the text as one bracketed paste, so dialog digit hotkeys can't fire.
 - tmux never parses the text for key names or `;`.
-- **Residual risk:** tmux 3.4 can't report whether the pane enabled bracketed paste. Layers 1–3 below still apply.
+- kingkai never calls `send-keys`.
 
-**Which session a pane belongs to.** The hook client records `$TMUX_PANE` in every payload (`_kk.pane`). `ReferenceService` checks typeability against the **newest session whose `tmux_pane` equals the target pane**. If no session is bound to the pane yet (Claude has just started), only the pane checks below apply.
-
-**Checks just before typing.** These are layered and all must pass; otherwise the tmux typer declines and the next typer in the fallback order is tried.
-1. The domain flag: no agent of the bound session is in `awaiting_permission` (§4.3).
-2. `tmux display-message -p -t <pane> '#{pane_id} #{pane_in_mode} #{pane_current_command}'`. The pane must exist, must not be in copy mode, and its command must be `claude` or `node`.
-3. **Dialog detection on screen.** `tmux capture-pane -p -t <pane>` shows the visible screen, which must not match a dialog signature.
-   - The primary signature is `Esc to cancel` within the bottom 15 lines. It matched the permission and folder-trust dialogs, and none of the idle, working, `@`, `/` or after-Esc screens.
-   - The secondary signature is a line matching `^\s*❯ \d+\. ` (a numbered menu cursor).
-   - The signatures live in `adapters/tmux_dialogs.py` as data and are tested against `tests/fixtures/screens/`.
-   - **Layer 1 override:** if the dialog flag is more than 1.5 s old and the screen shows no dialog, the flag is treated as stale (a cancelled dialog) and cleared.
+**Checks before typing (policy (a)).** Every check must pass; otherwise the tmux typer returns `Declined` and the clipboard is tried.
+1. **Dialog flag** (in `ReferenceService`). Use the newest session whose `tmux_pane` equals the target pane. If any agent in it has a dialog flag set **less than 10 s ago**, decline.
+   - Older flags are not cleared. They are left to check 3, because `PermissionRequest` can fire seconds before the dialog appears.
+   - If no session is bound to the pane yet, this check passes.
+2. **Pane state.** `tmux display-message -p -t <pane> '#{pane_id} #{pane_in_mode} #{pane_current_command}'`. The pane must exist, must not be in copy mode, and must be running `claude` or `node`.
+3. **Screen.** `tmux capture-pane -p -t <pane>` must not match a dialog signature.
+   - `Esc to cancel` in the bottom 15 lines, or a line matching `^\s*❯ \d+\. `.
+   - The signatures are data in `tmux.py`, tested against `tests/fixtures/screens/`.
    - The screen is never used to infer prompt contents: the grey prompt suggestion looks like real text in `capture-pane -p`.
 
-**Clean environment.** `kingkai up` starts the Claude pane with the parent's Claude Code session variables removed: `CLAUDECODE`, `CLAUDE_CODE_*` and `CLAUDE_PID`. They leak into child processes otherwise (Spike 0b).
+**Residual risk.** tmux 3.4 can't report whether the pane enabled bracketed paste. The three checks still apply.
 
-**Fallback.** The clipboard comes next. If no clipboard works, the TUI shows the text in a selectable widget.
+**Fallback:**
+- **`ClipboardTyper(command)`.** One class driven by a `ClipboardCommand` row (argv builder, stdin encoding, whether to wait). `detect_clipboard(env, which)` picks the row.
+- **Nothing works.** If no clipboard works either, the TUI shows the text in a selectable widget, and `y` retries.
 
-| Platform | Command | Notes |
+| Row | Command | Notes |
 |---|---|---|
-| WSL | `powershell.exe -NoProfile -NonInteractive -Command "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>')))"` | `clip.exe` garbles anything that isn't ASCII (tested). Takes about 0.2 s. |
-| macOS | `pbcopy`, with `LANG=en_US.UTF-8` in its env | |
-| Wayland | `wl-copy` | Do not wait on piped stdout: it forks |
-| X11 | `xclip -selection clipboard` | |
-
-**Spike 0b answers** (`docs/spikes/0b-tmux-typing.md`):
-- `#L` resolves and the model receives exactly that line; `:` doesn't resolve.
-- The `@` menu closes on the trailing space, and the text is left unchanged.
-- The reference is inserted at the cursor.
-- While Claude is working, the text stays in the prompt and isn't submitted.
-- `()` and `[]` paths work.
-- `pane_current_command` is `claude` for the native install.
+| WSL | `powershell.exe -NoProfile -NonInteractive -Command "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>')))"` | `clip.exe` garbles anything that isn't ASCII. Takes about 0.2 s. |
+| macOS | `pbcopy` with `LANG=en_US.UTF-8` | |
+| Wayland | `wl-copy` | Don't wait on piped output: it forks |
+| X11 | `xclip -selection clipboard` | Same as Wayland |
 
 ---
 
 ## 9. Security model
 
-kingkai is a process that types into a terminal running an agent with tool access, so it is a target. These rules are not negotiable. **Each one is enforced by the test named next to it.** Tests marked † are property-based (hypothesis).
+kingkai types into a terminal running an agent with tool access, so it is a target. **Each rule is enforced by the tests named next to it, and this table is the only list of security test names.** Tests marked † are property-based (hypothesis).
 
-| # | Rule (from the plan unless marked *new*) | Mechanism | Enforcing test(s) |
+| # | Rule | Mechanism | Enforcing test(s) |
 |---|---|---|---|
-| S1 | **Listen on localhost only** | aiohttp `TCPSite("127.0.0.1", 0)`. Binding to anything else is not configurable. | `tests/adapters/http/test_bind.py::test_binds_loopback_only` (checks `getsockname()[0] == "127.0.0.1"`). `test_config_rejects_bind_host_key`. |
-| S2 | **Per-session token** | `secrets.token_urlsafe(32)`, new on every `watch` start, stored only in `.kingkai/session.json` (0600). Compared with `hmac.compare_digest`. Sent in the `X-Kingkai-Token` header, never in the URL. | `tests/adapters/http/test_guards.py::test_missing_token_403`, `::test_wrong_token_403`, `::test_token_from_previous_session_403`, `::test_token_in_query_string_ignored`. `tests/adapters/test_session_file.py::test_mode_0600`, `::test_new_token_each_start`. |
-| S3 | **Origin check** | `Origin` must exactly match an entry in `allowed_origins`: no wildcards, no suffix or prefix matching. A missing `Origin` is rejected on POST. | `test_guards.py::test_foreign_origin_403`, `::test_missing_origin_403`, `::test_null_origin_403`, `::test_lookalike_origin_403` (`http://localhost:3000.evil.com`, `http://localhost:30000`). `::test_preflight_foreign_origin_has_no_acao`. |
-| S3a | *new*: **Host check** (DNS rebinding) | `Host` must be `127.0.0.1:<port>` or `localhost:<port>` | `test_guards.py::test_rebinding_host_403` |
-| S3b | *new*: **Force a preflight** | POST requires `Content-Type: application/json`. Otherwise 415, so no "simple" CORS request can get through. | `test_guards.py::test_form_content_type_415`, `::test_text_plain_415` |
-| S3c | *new*: **Body limit** | `client_max_size = 4096` | `test_guards.py::test_oversized_body_413` |
-| S4 | **References only to files that exist inside the project** | `parse_reference` uses `SourceFiles.resolve` (realpath, which follows symlinks) and requires `is_relative_to(realpath(root))`, a regular file, and `1 ≤ line ≤ line_count`. | `tests/domain/test_reference.py::test_dotdot_escape_rejected`, `::test_absolute_outside_root_rejected`, `::test_directory_rejected`, `::test_missing_file_rejected`, `::test_line_zero_and_past_eof_rejected`, `::test_resolved_path_always_inside_root`†, `::test_domain_rechecks_containment_against_lying_adapter`. Real filesystem, using `tmp_path` with real symlinks: `tests/adapters/test_source_files.py::test_symlink_escape_rejected`, `::test_symlinked_parent_dir_escape_rejected`, `::test_symlink_inside_root_allowed`. |
-| S5 | **Normalize the path** | Normalized to POSIX, relative to the root. `.` and `..` segments, empty segments and backslashes are rejected. Input must be an absolute `file://` URL or an absolute POSIX path (Spike 0a). Anything else is `bad_scheme`. Candidates are tried in order, and the first that passes wins. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected` (`http:`, `about:`, `webpack-internal:`, relative paths), `tests/application/test_reference_service.py::test_first_valid_candidate_wins`, `::test_node_modules_frame_skipped_when_outside_root`, `::test_backslash_rejected` |
-| S6 | **No newlines or control characters** | Any char of Unicode category `Cc`, `Cf`, `Zl` or `Zp` in a `source.*` field causes a **rejection**. The same chars are **stripped** from display-only fields. The rendered text must match the grammar regex (§8.4). | `test_reference.py::test_rejects_control_chars` (parametrized over `\n \r \t \x00 \x1b   ‮ ​`). `::test_render_matches_grammar`†. `::test_render_never_contains_cr_lf_esc`†. `tests/adapters/http/test_payload.py::test_display_fields_stripped_not_rejected`. |
-| S7 | **No free text, only `@path<sep>line `** | Typing goes through `PromptTyper.type_reference(ref: Reference)`, which takes no `str` (mypy enforces this). `Reference` can only be minted through `parse_reference`: `__post_init__` checks for the private `_MINT` sentinel, and ruff `PLC2701` bans importing private names. `Reference.render()` checks the grammar regex again, and every typer (tmux and clipboard) types only `render()` output. `label`, `selector`, `page` and `view` are display-only. | `tests/domain/test_reference.py::test_direct_construction_raises`, `::test_render_rechecks_grammar`. `tests/application/test_reference_service.py::test_label_selector_page_view_never_typed`. `tests/adapters/test_clipboard.py::test_copies_only_rendered_reference`. mypy `--strict` and ruff in CI. |
-| S8 | **Never send Enter** | The only commands are `load-buffer -b <buf> -` (text on stdin) and `paste-buffer -p -d -b <buf> -t <pane>`. No code path runs `send-keys`, so no key names are ever sent. The text never contains CR or LF (S6). | `test_tmux.py::test_commands_exact`, and `::test_never_invokes_send_keys`†: for any Reference, exactly two commands run, `["tmux","load-buffer","-b",buf,"-"]` with `stdin == text`, then `["tmux","paste-buffer","-p","-d","-b",buf,"-t",pane]`, and no argv contains `send-keys`. Integration: `tests/integration/test_tmux_real.py::test_text_arrives_without_newline`. It uses a real tmux server on a private `-L` socket; the pane runs a byte recorder that turns bracketed paste on. The test asserts the exact bytes received, `ESC[200~` + text + `ESC[201~`, and that there is no `\r` or `\n`. |
-| S9 | *new*: **Never type into a dialog** | Three layers (§8.4), and every one must pass: (1) the agent-scoped `awaiting_permission` flag of the session bound to the pane; (2) the pane is not in copy mode and is running `claude` or `node`; (3) `capture-pane` matches no recorded dialog signature. If any layer fails, the reference goes to the clipboard. The residual risk is in §16 Q-S9. | `test_reference_service.py::test_permission_prompt_falls_back_to_clipboard`, `::test_uses_session_bound_to_target_pane`. `tests/domain/test_reducer.py::test_subagent_activity_does_not_clear_main_dialog_flag`, `::test_late_notification_after_tool_start_still_blocks`, `::test_idle_prompt_does_not_block`. `test_tmux.py::test_declines_when_pane_in_mode`, `::test_declines_when_dialog_signature_on_screen` (fixture screens from Spike 0b). Integration: `test_tmux_real.py::test_capture_pane_dialog_detected`. |
-| S10 | *new*: **Hook client can't harm the session** | It always exits 0 with empty stdout and stderr, uses the stdlib only, and validates `session_id` before using it in a path. The spool has mode 0600 inside a 0700 directory. | `tests/hook_client/test_main.py::test_exit_zero_on_garbage`, `::test_no_output_ever`, `::test_bad_session_id_dropped`, `::test_spool_modes`. import-linter contract `hook-client-stdlib-only`. |
-| S11 | *new*: **Rate limit** | At most 5 references per second. Excess requests get 429. This stops a buggy overlay from flooding the prompt. | `test_guards.py::test_rate_limit_429` (with an injected clock) |
+| S1 | **Listen on localhost only** | `TCPSite("127.0.0.1", 0)`. The bind address can't be configured. | `tests/adapters/http/test_app.py::test_binds_loopback_only`. `tests/adapters/test_config.py::test_bind_host_key_rejected` |
+| S2 | **Per-session token** | `secrets.token_urlsafe(32)`, new on each `watch` start, kept only in the 0600 session file. Compared with `hmac.compare_digest`, and read only from the `X-Kingkai-Token` header. | `tests/adapters/http/test_guards.py::test_missing_token_403`, `::test_wrong_token_403`, `::test_token_from_previous_session_403`, `::test_token_in_query_string_ignored`. `tests/adapters/test_session_file.py::test_mode_0600`, `::test_new_token_each_start` |
+| S3 | **Origin check** | `Origin` must match `allowed_origins` exactly. A missing or `null` Origin on POST is rejected. | `test_guards.py::test_foreign_origin_403`, `::test_missing_origin_403`, `::test_null_origin_403`, `::test_lookalike_origin_403` (`http://localhost:3000.evil.com`, `http://localhost:30000`), `::test_preflight_foreign_origin_has_no_acao` |
+| S3a | **Host check** (DNS rebinding) | `Host` must be `127.0.0.1:<port>` or `localhost:<port>`. | `test_guards.py::test_rebinding_host_403` |
+| S3b | **Force a preflight** | POST requires `Content-Type: application/json`; anything else gets 415. | `test_guards.py::test_form_content_type_415`, `::test_text_plain_415` |
+| S3c | **Body limit** | `client_max_size = 4096`. | `test_guards.py::test_oversized_body_413` |
+| S4 | **Only files that exist inside the project** | `SourceFiles.resolve` uses realpath, which follows symlinks. `parse_reference` requires a regular file whose real path `is_relative_to(realpath(root))`, re-checks that itself, rejects excluded directories, and requires `1 ≤ line ≤ line_count`. | `tests/domain/test_reference.py::test_dotdot_escape_rejected`, `::test_absolute_outside_root_rejected`, `::test_directory_rejected`, `::test_missing_file_rejected`, `::test_line_zero_and_past_eof_rejected`, `::test_excluded_dirs_rejected` (`node_modules`, `.next`, `.git`, `.venv` inside the root), `::test_domain_rechecks_containment_against_lying_adapter`, `::test_resolved_path_always_inside_root`†. `tests/adapters/test_source_files.py::test_symlink_escape_rejected`, `::test_symlinked_parent_dir_escape_rejected`, `::test_symlink_inside_root_allowed` (real symlinks under `tmp_path`) |
+| S5 | **Normalize the path** | Input must be an absolute `file://` URL or an absolute POSIX path of at most 1024 characters; otherwise `bad_scheme` or `too_long`. The output is POSIX, relative to the root, and NFC. Backslashes and empty segments are rejected. Candidates are tried in order. | `test_reference.py::test_normalizes_absolute_inside_root`, `::test_file_url_prefix`, `::test_unknown_scheme_rejected` (`http:`, `about:`, `webpack-internal:`, relative), `::test_backslash_rejected`, `::test_too_long_rejected`, `::test_nfc_normalization`. `tests/application/test_reference_service.py::test_first_valid_candidate_wins`, `::test_node_modules_frame_skipped` |
+| S6 | **No newlines or control characters** | A character of Unicode category `Cc`, `Cf`, `Zl` or `Zp` in a candidate causes a rejection. The same characters are stripped from display fields. The rendered text must match the grammar. | `test_reference.py::test_rejects_control_chars` (`\n \r \t \x00 \x1b   ‮ ​`), `::test_render_matches_grammar`†, `::test_render_never_contains_cr_lf_esc`†. `tests/adapters/http/test_payload.py::test_display_fields_stripped_not_rejected`, `::test_bad_kind_422`, `::test_more_than_10_candidates_422` |
+| S7 | **No free text, only `@path#L<line> `** | `PromptTyper.type_reference` takes a `Reference`, not a `str`. `Reference.__init__` raises, and only `parse_reference` calls `Reference._mint`: ruff `SLF001` flags any other access, and an AST test checks it too. `render()` re-checks the grammar, and every typer types only `render()` output. Display fields are never typed. | `test_reference.py::test_direct_construction_raises`, `::test_render_rechecks_grammar`. `tests/architecture/test_reference_minting.py::test_mint_called_only_in_parse_reference`. `test_reference_service.py::test_label_selector_page_view_never_typed`. `tests/adapters/test_clipboard.py::test_copies_only_rendered_reference`. mypy `--strict` and ruff in CI. |
+| S8 | **Never send Enter** | Delivery is exactly `load-buffer -b <buf> -` (text on stdin), then `paste-buffer -p -d -b <buf> -t <pane>`. `send-keys` is never called, and the text has no CR or LF (S6). | `tests/adapters/test_tmux.py::test_commands_exact`, `::test_never_invokes_send_keys`†. `tests/integration/test_tmux_real.py::test_text_arrives_without_newline`: a real tmux server on a private `-L` socket, with a byte recorder in the pane that turns on bracketed paste. It asserts the exact bytes `ESC[200~` + text + `ESC[201~`. |
+| S9 | **Never type into a dialog** | The three checks in §8.4: a recent dialog flag for the pane's session, the pane state, and the screen signatures. If any check fails, the clipboard is used. | `test_reference_service.py::test_recent_permission_request_falls_back_to_clipboard`, `::test_old_flag_defers_to_screen_check`, `::test_uses_session_bound_to_target_pane`. `tests/domain/test_reducer.py::test_permission_request_sets_flag_for_that_agent_only`, `::test_subagent_activity_does_not_clear_main_dialog_flag`, `::test_late_permission_request_after_tool_start_still_blocks`, `::test_turn_boundary_clears_dialog_flags`. `test_tmux.py::test_declines_when_pane_in_mode`, `::test_declines_when_command_not_claude_or_node`, `::test_signatures_match_only_dialog_screens` (every fixture screen). `test_tmux_real.py::test_capture_pane_dialog_detected` |
+| S10 | **The hook client can't harm the session** | It always exits 0 with empty stdout and stderr, uses only the stdlib, and validates `session_id` before using it in a path. The spool is 0600 inside 0700 directories, and the shim swallows every failure. | `tests/hook_client/test_main.py::test_exit_zero_on_garbage`, `::test_no_output_ever`, `::test_unwritable_state_dir_still_exit_zero`. `tests/hook_client/test_spool.py::test_bad_session_id_dropped`, `::test_spool_modes`. `tests/adapters/test_settings_installer.py::test_shim_exits_zero_when_python_missing`, `::test_shim_exits_zero_when_module_missing`. import-linter `hook-client-stdlib-only` |
+| S11 | **Rate limit** | At most 5 references per second; more get 429. | `test_guards.py::test_rate_limit_429` (injected clock) |
+| S12 | **Data is never markup** | Strings that come from data are rendered as Rich `Text` objects (§6.1). | `tests/ui/test_widgets.py::test_display_strings_rendered_without_markup` (`app/[slug]/page.tsx`, `[bold]x[/]`) |
 
-**Threats we consider, and the rule that stops each one:**
+**Threats, and the rules that stop them:**
 - A malicious website POSTs to the daemon: S3, S3b, S2.
 - DNS rebinding: S3a.
 - Another localhost app on a different port: S3 (exact match) and S2.
-- Path traversal or symlink escape: S4 and S5.
-- Terminal injection through control characters or key names: S6, S7, S8.
-- Accidentally approving a permission prompt: S9.
+- Path traversal or symlink escape: S4, S5.
+- Terminal injection: S6, S7, S8.
+- Accidentally approving a dialog: S9.
 - Flooding: S11.
+- Spoofed TUI output: S12.
 
-**Out of scope:** a local attacker who can already run commands as the user. That attacker can read the token file and type into tmux directly.
+**Out of scope:**
+- A local attacker who can already run commands as the user: they can read the token file and use tmux directly.
+- Scripts and browser extensions running inside the dev app's own origin: they can read the injected token. That is the trust boundary, and the docs say so.
 
 ---
 
@@ -639,196 +606,153 @@ kingkai is a process that types into a terminal running an agent with tool acces
 
 | Class | Example | Behaviour |
 |---|---|---|
-| Untrusted input is malformed | A bad spool or transcript line, an unknown event, a missing field | Translation returns `None`. The line is skipped and counted in `Diagnostics` (shown in a TUI footer, e.g. "3 lines skipped"). One log line per distinct reason. **Never crash.** Unknown fields are ignored so that kingkai keeps working when Claude Code adds fields. |
-| A reference is rejected | Path outside the root, bad line | A `Rejected(reason)` value, returned as 4xx `{"error": reason}`. The overlay shows a toast, and the TUI "last reference" panel shows the reason. |
-| Delivery declined or failed | tmux missing, pane gone, pane in copy mode, permission dialog | The next typer in the fallback is tried. The TUI shows which one delivered. If all of them fail, the text is shown so the user can copy it. |
-| Environment or startup | Not a project dir, `CLAUDE_PROJECT_DIR` mismatch, spool dir not writable, tmux older than 3.2 | Fail fast with a one-line error and a fix hint. Exit code 2. `doctor` runs the same checks. |
-| Bug in a background task | An exception in a tailer | A supervisor around each worker logs the traceback to `<state>/kingkai.log`, raises an `internal` alert in the TUI, and restarts the task with exponential backoff (max 30 s). One task failing doesn't take the UI down. |
-| Hook client | Anything | It swallows every exception and exits 0 silently (S10). |
+| Malformed untrusted input | A bad spool or transcript line, an unknown event, a missing field | The translator returns `None` and the line is counted in `Diagnostics` (shown in the footer). kingkai never crashes. Unknown fields are ignored, so new Claude Code fields don't break it. |
+| Rejected reference | Outside the root, a bad line | `Rejected(reason)`, returned as a 4xx. The overlay shows a toast and the TUI shows the reason. |
+| Delivery declined or failed | tmux missing, pane gone, a dialog | The next typer is tried. If none works, the text is shown for copying. |
+| Environment | Spool dir not writable, tmux older than 3.2, invalid `settings.local.json` | Fail fast with a one-line message and a fix hint, exit code 2. `doctor` runs the same checks. |
+| Bug in a background task | An exception in a tailer | `supervise()` logs the traceback, raises an `internal` alert, and restarts the task with exponential backoff (max 30 s). |
+| Hook client | Anything | Swallowed; it exits 0 silently (S10). |
 
-Exceptions are used for programming errors and environment failures. Typed return values (`Rejected`, `DeliveryOutcome`, `None` from translators) are used for outcomes that are **expected** when handling untrusted input. There are no bare `except:` clauses outside the hook client and the supervisor, and ruff's `BLE` rule enforces that.
-
-Logging uses stdlib `logging` writing to `<state>/kingkai.log` (rotating, 1 MB × 3). Nothing is written to stdout while the TUI is running. Prompt text is never logged.
+- **Exceptions vs results.** Exceptions are for programming errors and environment failures. Typed results (`Rejected`, `DeliveryOutcome`, `None` from translators) are for outcomes that are expected with untrusted input.
+- **No bare except.** ruff `BLE` allows none outside the hook client and the supervisor.
+- **Logging.** It goes to `<state>/kingkai.log` (rotating, 1 MB × 3). Nothing is written to stdout while the TUI runs, and prompt text is never logged.
 
 ---
 
 ## 11. Testing strategy
 
-There is one test tree, and it mirrors `src/`. The test pyramid weighs heavily towards pure tests.
+The test tree mirrors `src/`, and the pyramid is weighted towards pure tests.
 
-### 11.1 Unit tests (fast, pure; most of the suite)
+### 11.1 Unit tests (most of the suite)
 
-- **Domain.** The reducer, the detectors, reference parsing and rendering, and usage/cost, all with table-driven `pytest.mark.parametrize`. A `FakeClock` and a `FakeSourceFiles` (an in-memory tree; real symlinks are tested against the real adapter, S4) are injected.
+- **Domain.** The reducer, detectors, references and cost, with table-driven `parametrize`, `FakeClock` and `FakeSourceFiles`.
 - **Property tests** (hypothesis):
-  - For any interleaving of the `Started` and `Succeeded`/`Failed` events of a set of tool calls, `reduce` gives the same **per-tool-call state** and the same file touches (out-of-order tolerance). Turn state, dialog flags, alerts and last activity *depend on order by design*, so they get example-based tests instead.
-  - Applying an event twice is the same as applying it once (idempotency).
-  - For any generated raw path or line, `parse_reference` either rejects it or returns a `Reference` whose rendered text matches the grammar regex and resolves inside the root (S4, S6).
-  - For any payload, `shrink` returns valid JSON whose strings are all ≤ 512 characters, with the same fingerprint for equal inputs and different fingerprints for different `tool_input`s.
-- **Presenters.** State in, view model out. No Textual involved.
+  - **Out-of-order tolerance:** for any interleaving of a set of calls' start and end events, the per-call state and the file touches are the same. Turn state, dialog flags, alerts and activity depend on order by design, so they get example tests instead.
+  - **Idempotency:** applying an event list twice gives the same state as applying it once.
+  - **References:** for any generated candidate, `parse_reference` either rejects it or returns a `Reference` whose rendered text matches the grammar and resolves inside the root.
+  - **Shrink:** for any payload, `shrink` returns JSON in which every string is ≤ 512 characters, and whose fingerprints are equal exactly when the inputs are equal.
+- **Presenters.** State in, view model out. No Textual.
 
 ### 11.2 Contract tests against Claude Code formats
 
-- `tests/fixtures/hooks/*.json` and `tests/fixtures/transcripts/*.jsonl` are **real payloads**. They are recorded in Phase 0 and Phase 1 from runs against `examples/` (never an employer project) and scrubbed by `scripts/scrub_fixture.py`, which replaces home paths, user names and session ids.
-- Each fixture is loaded through the schema and translator, and the domain event that comes out is asserted.
-- When Claude Code changes a format, a fixture test fails in one place (the anti-corruption layer).
-- `tests/fixtures/README.md` records the Claude Code version each fixture came from.
+- **Real data.** `tests/fixtures/` holds real hook payloads, transcript lines and screen captures, from Claude Code 2.1.303, scrubbed (see the README there).
+- **Spool shape.** The hook fixtures are **raw hook stdin**. Tests turn them into spool lines with `tests/support/spool.py::as_spool_line(payload, n)`, which calls the real `shrink` and `envelope` with deterministic ids (`f"{n:032x}"`) and times. That way the fixtures exercise the hook client's output format too.
+- **One place to fail.** When Claude Code changes a format, the fixture tests fail in the anti-corruption layer.
+- **Re-recording.** `scripts/scrub_fixtures.py` turns a new capture into fixtures, and `tests/fixtures/README.md` records the version.
 
 ### 11.3 Adapter integration tests
 
-- **HTTP:** `aiohttp.test_utils.TestClient` runs the whole S1–S11 matrix against the real app factory with fake ports.
-- **tmux:** a real tmux server on a private socket (`tmux -L kingkai-test-<uuid>`). The pane runs `python -m tests.integration.byte_recorder`, which writes raw stdin bytes (in raw mode) to a file. Tests assert exact bytes. This job runs where tmux is installed (CI Ubuntu and macOS) and is skipped elsewhere with a clear reason.
-- **Tailer:** writes to temporary files in chunks that split lines, rotates them, and truncates them.
-- **Settings installer:** golden-file tests that it is idempotent and keeps unrelated user hooks and keys intact.
-- **Django integration:** the Django test client on `examples/django-demo` templates, asserting `data-src` values, include/extends mapping, script injection and DEBUG gating. Runs against Django 5.2 LTS and 6.1.
+- **HTTP:** `aiohttp.test_utils.TestClient` against the real app factory, with fake ports.
+- **tmux:** a real tmux server on a private socket, `tmux -L kingkai-test-<uuid>`. The pane runs `tests/integration/byte_recorder.py`, which turns on bracketed paste and writes raw stdin bytes to a file. Marked `integration`, and run in the Ubuntu CI job.
+- **Tailer:** temp files written in chunks that split lines, then rotated and truncated.
+- **Settings installer and shim:** golden files, idempotency, preservation of user hooks, invalid JSON, and real `sh` runs of the shim.
+- **Django:** the Django test client on `examples/django-demo` (Phase 4), against Django 5.2 LTS and 6.1.
 
 ### 11.4 UI tests
 
-- **Pilot** (`App.run_test(size=(120, 40))`): the feed reaches the panels, keyboard navigation works, and the session switcher works.
-- **Snapshots** (`pytest-textual-snapshot`): one per main screen state (empty, live session with 2 subagents, alerts, rejected reference). Snapshot tests always run after `await pilot.pause()`, and around screen switches they wait for Textual 8's 50 ms delay.
+- **Pilot** (`App.run_test(size=(120, 40))`): events reach the panels, and the key bindings work.
+- **Snapshots** (`pytest-textual-snapshot`): 120×40 in Phase 1, and 80×24 once the tabbed layout lands in Phase 2. Always take them after `await pilot.pause()`.
 
-### 11.5 End-to-end (Phase 3 onwards, separate CI job)
+### 11.5 End-to-end (Phase 3 onwards)
 
-`pytest-playwright` drives Chromium against `examples/next-demo` and `examples/django-demo`, with kingkai running and a tmux byte recorder as the Claude pane. The test Alt+clicks an element and asserts the exact typed bytes. The same job also checks that a page served from a foreign origin gets a 403.
+`pytest-playwright` drives Chromium against the example apps, with a byte recorder standing in as the Claude pane. It checks the four Spike 0a cases (client root, server element, `.map` item, imported `ui/Button`) and the Django click, and asserts the exact bytes that get typed. The security matrix stays in the faster HTTP tests.
 
 ### 11.6 Architecture tests
 
-- import-linter contracts (§3.2) run in CI: `layers` (ui | adapters → application → domain), `hook-client-stdlib-only` (forbids `kingkai.*` and every third-party package), and `domain-pure` (forbids asyncio, msgspec, textual and aiohttp in `kingkai.domain`).
+- **import-linter:**
+  - `layers` (ui | adapters → application → domain);
+  - `domain-pure` (no asyncio, msgspec, textual or aiohttp in `kingkai.domain`);
+  - `hook-client-stdlib-only` (no other `kingkai` package and no third-party package; `include_external_packages = true`).
+- **`test_reference_minting.py`** (S7).
 
 ### 11.7 Overlay (TypeScript)
 
-- Vitest covers source extraction (attribute parsing, path normalization helpers) and the request builder.
-- The overlay holds no security logic. All validation happens in Python (S4–S7).
+Vitest covers candidate resolution (mocked fiber and fetch), absolutizing paths against the app root, the 10-candidate cap and the request builder. The overlay holds no security logic.
 
 ### 11.8 Gates
 
-- **Coverage:** branch coverage ≥ 90 % for `domain` and `application`, ≥ 80 % overall, enforced by `coverage report --fail-under` per package.
-- **Speed:** all unit tests together < 5 s.
+- One branch-coverage gate: **≥ 85 %**.
+- The unit tests finish in under 5 s.
 
 ---
 
 ## 12. Toolchain
 
-Versions were checked on PyPI, npm and the GitHub releases on 2026-10-19.
+Versions were checked on PyPI, npm and GitHub on 2026-10-19.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Python | `requires-python = ">=3.12"`; CI on 3.12, 3.13, 3.14, 3.15 | 3.12 is the oldest version with security support that all the dependencies cover (Django 6.1 needs it). It gives us PEP 695 generics and `StrEnum`. |
-| Packaging and env | **uv** 0.13 with the **uv_build** backend, a `src/` layout, `[project.scripts]` (`kingkai`, `kingkai-hook`), and `[dependency-groups]` for dev | One fast tool for locking, venvs, running and building. uv_build needs no config for a pure-Python package. `uv.lock` is committed. |
-| Runtime deps | `textual>=8.2`, `aiohttp>=3.14`, `msgspec>=0.22`, `cyclopts>=5.2`. Extra `django = ["django>=5.2"]` | **aiohttp:** HTTP that runs in Textual's loop without taking over signal handlers. **msgspec:** typed, strict and fast decoding of large JSONL at the boundary, and its Structs are plain classes for mypy. **cyclopts:** a type-hint driven CLI, testable by calling it with argv, and lighter than Typer/Click. |
-| Lint and format | **ruff** 0.17: `ruff format` plus `extend-select` for `ANN, ASYNC, S, TRY, PTH, DTZ, FBT, ARG, ERA, T20, BLE, PL, TC, FURB, RUF`, relaxed for tests | One tool, very fast. `extend-select` keeps 0.16's larger default set. `PLC2701` backs S7. Pydocstyle (`D`) is left out on purpose: names and types should carry the meaning, and docstrings are written where they explain *why*. Forcing them everywhere produces noise. |
-| Type checking | **mypy** 2.4 `--strict` as the CI gate. **ty** is recommended in the editor but not gated. | mypy is the stable reference for typeshed, and in research it caught a real Textual gotcha (the `tree` property clash). ty is still a 0.0.x beta, so gating CI on it would break builds for no reason. pyright strict was noisy with Textual's generics. |
-| Tests | **pytest 8.4.x (`>=8.4,<9`)**, pytest-asyncio 1.4 (`asyncio_mode = "auto"`), pytest-textual-snapshot 1.1, hypothesis, pytest-cov | `pytest<9` is required because pytest-textual-snapshot pins syrupy 4.8, which caps pytest. Lift the cap when the plugin updates (a Renovate/Dependabot note). |
-| Architecture | **import-linter** 2.15 | Turns the layering in §3.2 into a CI failure instead of a review comment. |
-| Git hooks | **prek** running a standard `.pre-commit-config.yaml` (works with pre-commit too). Hooks: ruff, ruff-format, mypy (local), import-linter (local), biome (overlay), **conventional-pre-commit** v4.4 at the `commit-msg` stage | Conventional Commits get enforced on every commit, not just remembered. prek is fast and uv-native, and the config stays portable. |
-| CI | **GitHub Actions** with `astral-sh/setup-uv@v10`. Jobs: `lint` (ruff, import-linter), `types` (mypy), `test` (matrix of Python 3.12–3.15 × ubuntu/macos, coverage gate), `integration` (tmux installed), `overlay` (Node 24 LTS: biome, tsc, vitest, build), `e2e` (Phase 3+). Dependabot for `uv`, `npm` and `github-actions`. Actions pinned by SHA. | The jobs are fast and separate, so a failure says what broke. |
-| Overlay | **TypeScript 7** (strict, `noEmit` checking), **esbuild** 0.28 (IIFE bundle), **Biome** 2.5 (lint and format), **Vitest** 5, **npm** on **Node 24 LTS** | The overlay has a handful of dev deps, so npm is enough and adds no tooling. Biome matches the conventions of the maintainer's other repos. The bundle is built in CI and placed in `src/kingkai/assets/` before `uv build`; it is never committed. |
-| Release (v2) | release-please driven by Conventional Commits, publishing to PyPI via Trusted Publishing | Deferred: PyPI polish is a v2 item. |
-| License | **MIT** | A dev tool wants maximum adoption with minimal friction. Apache-2.0's patent grant matters little for a personal tool like this, and MIT matches the maintainer's other public repos. |
+| Python | `requires-python = ">=3.12"`. CI runs 3.12 and 3.15 on Ubuntu and 3.15 on macOS. | 3.12 is the oldest version with security support that every dependency covers (Django 6.1 needs it). Testing the lowest and newest versions catches what the middle ones would. |
+| Packaging | **uv** 0.13 with the **uv_build** backend, a `src/` layout, `[project.scripts]` (`kingkai`, `kingkai-hook`), and `[dependency-groups]`. `uv.lock` is committed. | One fast tool for locking, environments, running and building. uv_build needs no config for a pure-Python package. |
+| Runtime deps | `textual>=8.2`, `aiohttp>=3.14`, `msgspec>=0.22`, `cyclopts>=5.2`; the extra `django = ["django>=5.2"]` | **aiohttp:** runs in Textual's loop without taking over signal handlers. **msgspec:** typed, strict and fast decoding of large JSONL; its Structs are plain classes to mypy. **cyclopts:** a type-hint CLI that tests can call with argv, lighter than Typer/Click. |
+| Lint and format | **ruff** 0.17: `ruff format`, plus `extend-select` for `ANN, ASYNC, S, TRY, PTH, DTZ, FBT, ARG, ERA, T20, BLE, PL, TC, FURB, RUF, SLF`, relaxed for tests | One fast tool. `extend-select` keeps the larger default set added in ruff 0.16. `SLF` backs S7. Pydocstyle (`D`) is left out: names and types carry the meaning, and docstrings explain *why* where needed. |
+| Type checking | **mypy** 2.4 `--strict` as the gate; **ty** in the editor, not gated | mypy is the stable reference, and it caught a real Textual gotcha in research. ty is still 0.0.x beta. pyright strict is noisy with Textual's generics. |
+| Tests | **pytest `>=8.4,<9`**, pytest-asyncio 1.4 (`asyncio_mode = "auto"`), pytest-textual-snapshot 1.1, hypothesis, pytest-cov | `<9` because pytest-textual-snapshot pins syrupy 4.8. Lift it when the plugin updates. |
+| Architecture | **import-linter** 2.15 | Turns the layering into a CI failure instead of a review comment. |
+| Git hooks | **prek** with a standard `.pre-commit-config.yaml`: ruff, ruff-format, mypy, import-linter, and **conventional-pre-commit** v4.4 at `commit-msg` | Enforces Conventional Commits. prek is fast and uv-native, and the config stays compatible with pre-commit. |
+| CI | **GitHub Actions** with `astral-sh/setup-uv@v10`. Jobs: `check` (ruff, format, mypy, import-linter); `test` (the matrix above plus the coverage gate; installs tmux and runs the integration tests on Ubuntu); `overlay` (Node 24: biome, tsc, vitest, build; from Phase 3); `e2e` (from Phase 3). Dependabot for uv, npm and actions; actions pinned by SHA. | Few jobs, and each failure says what broke. |
+| Overlay | **TypeScript 7** (strict, `noEmit`), **esbuild** 0.28 (IIFE), **Biome** 2.5, **Vitest** 5, **npm** on **Node 24 LTS**; **bippy** pinned exactly | A handful of dev deps, so npm is enough. Biome matches the maintainer's other repos. The bundle is built in CI before `uv build`, and never committed. |
+| Release | Phase 5: a hand-made `v0.1.0` tag and GitHub release. PyPI via Trusted Publishing is v2. | PyPI polish is a v2 item. |
+| License | **MIT** | Maximum adoption with minimal friction. Apache-2.0's patent grant adds little for a personal dev tool, and MIT matches the maintainer's other public repos. |
 
 ### 12.1 Code conventions
 
-- Domain types: `@dataclass(frozen=True, slots=True)`. Boundary types: `msgspec.Struct(frozen=True, forbid_unknown_fields=False)`.
-- Each module has one responsibility and one public surface (`__all__`). Files are kept to roughly ≤ 200 lines.
-- No `Any` outside the boundary schemas. `tool_input` is `Mapping[str, JsonValue]`, a recursive alias.
-- Time comes from `Clock`. `datetime.now()` is banned outside the clock adapter (ruff `DTZ` plus a review rule).
-- **Textual gotchas, from research:**
-  - Never name an attribute `tree` on an App or widget.
-  - Build typed widget refs in `__init__` and yield them in `compose`. Subscripted generics can't be passed to `query_one`.
+- **Types.** Domain types are `@dataclass(frozen=True, slots=True)`, except `Reference` (§3.4). Boundary types are `msgspec.Struct(frozen=True)`, with unknown fields ignored. The envelope field is declared as `kk: Envelope = msgspec.field(name="_kk")`.
+- **Modules.** One responsibility and one public surface (`__all__`) per module, roughly ≤ 200 lines each.
+- **No `Any`** outside `adapters/*/schema.py`.
+- **Time** comes from `Clock`. `datetime.now()` appears only in `adapters/clock.py` and the hook client.
+- **Textual:**
+  - Never name an attribute `tree`.
+  - Build typed widget refs in `__init__` and yield them in `compose`.
   - Write `BINDINGS: ClassVar[list[BindingType]]`.
-  - Textual 8 adds a 50 ms delay on screen switches, so tests pause before taking snapshots.
-- Commits follow Conventional Commits (commit-msg hook) with no attribution trailers. Public artifacts (fixtures, screenshots, docs) only use `examples/` or the maintainer's personal projects.
+  - Render data as `Text` (S12).
+  - Pause before taking snapshots.
+- **Commits** follow Conventional Commits with no attribution trailers. Public artefacts use only `examples/` or the maintainer's personal projects.
 
 ---
 
-## 13. Open questions resolved by spikes
+## 13. Open questions
+
+Q1–Q8 were resolved by Phase 0; see `docs/spikes/0a-react-source.md` and `docs/spikes/0b-tmux-typing.md`. The only one still open:
 
 | ID | Question | Resolved by | Default if inconclusive |
 |---|---|---|---|
-| Q1 | React source method | **Resolved (0a):** B, the runtime owner stack, alone | — |
-| Q2 | Path forms | **Resolved (0a):** the overlay resolves the raw URLs and sends only absolute `file://` URLs or POSIX paths | — |
-| Q3 | `#L` vs `:` as the separator | **Resolved (0b):** `#L` | — |
-| Q4 | `@` autocomplete, typing mid-text, during a turn, in a dialog | **Resolved (0b):** safe at the prompt. Dialogs need bracketed paste and the layers in §8.4. | — |
-| Q5 | `()` and `[]` in mentions | **Resolved (0b):** they work | — |
-| Q6 | `pane_current_command` | **Resolved (0b):** `claude` (native); `node` still accepted | — |
-| Q7 | `agent_id` on subagent tool events; transcript naming | **Resolved (0b):** confirmed; `subagents/agent-<agent_id>.jsonl` | — |
-| Q8 | Is usage cumulative across streamed lines? Is subagent usage duplicated? Cache-write tiers? | **Resolved (0b):** cumulative, so last wins; not duplicated; two tiers (5 m and 1 h), priced separately | — |
-| Q9 | Django: rewrite in `get_contents` or patch the nodelist; include/extends; debug toolbar | Phase 3 spike | Rewrite in `get_contents` |
+| Q9 | Django: rewrite in `get_contents` or patch the nodelist? How do include/extends/block map? Does it work with debug-toolbar? | The Phase 4 mini-spike (Task 4.0) | Rewrite in `get_contents` |
 
 ---
 
 ## 14. Non-goals
 
-These are out of the MVP, though several are fine for v2:
-
 - **Not in the MVP:**
-  - Comparing sessions with each other.
-  - Historical statistics.
-  - Vue and Svelte.
-  - The Jinja2 backend.
-  - An npm package for the Next integration.
-  - A polished PyPI release with a demo GIF.
-- **Out of scope, and no plans:**
-  - Local AI or any outbound network call.
-  - Changing Claude's behaviour: kingkai's hooks never block, approve, or inject context (`UserPromptSubmit` injection was ruled out).
-  - Parsing `Bash` commands to infer which files they touched.
-  - OpenTelemetry ingestion. It's a candidate future `EventSource`.
-  - Native Windows. WSL2, Linux and macOS are supported, and the hook client uses `fcntl`.
-  - Remote, multi-user or containerized setups, and any listening address other than 127.0.0.1.
-  - Typing anything other than a `Reference`, or sending any key other than literal characters.
-  - Production use of the Django or Next integrations: everything is gated on DEBUG or development.
+  - comparing sessions;
+  - historical statistics;
+  - Vue and Svelte;
+  - Jinja2;
+  - an npm package for Next;
+  - a PyPI release with a demo GIF;
+  - user-tunable alert thresholds;
+  - `#L<start>-<end>` ranges.
+- **Out of scope:**
+  - local AI or any outbound network call;
+  - changing Claude's behaviour (hooks never block, decide, or inject context);
+  - parsing `Bash` commands for file touches;
+  - OpenTelemetry ingestion;
+  - native Windows (WSL2, Linux and macOS are supported; the hook client uses `fcntl`);
+  - remote or multi-user setups, or any listening address other than 127.0.0.1;
+  - typing anything but a `Reference`;
+  - production use of the integrations (everything is gated on DEBUG or development).
 
 ---
 
-## 15. Decisions made while writing this spec (for review)
+## 15. Phases
 
-These are my calls. Each one is reversible, and none needs the maintainer's input unless they disagree.
-
-1. **Topology.** One process, with the daemon/TUI boundary as a port (§1.2, §5.3).
-2. **Hook transport.** A spool file, not a socket or an http hook, so the hook can never be noisy or fail (§1.2, §5.1).
-3. **Where hooks go.** `.claude/settings.local.json`, not the shared `settings.json`.
-4. **Reference format.** A closed `ReferenceFormat` enum, `#L` by default, settled by Spike 0b.
-5. **Paths with spaces.** Rejected in the MVP.
-6. **Typing during a turn.** Allowed; blocked only during permission prompts (S9, a new rule).
-7. **Security additions.** The Host check, the forced preflight, the body limit and the rate limit (S3a–S3c, S11), on top of the plan's rules.
-8. **Tailing.** Polling instead of inotify.
-9. **Cost.** An estimate from a bundled price table, always labelled API-equivalent; OTel is deferred.
-10. **Next integration.** A printed snippet instead of an npm package.
-11. **Library choices.** msgspec over pydantic, cyclopts over Typer, aiohttp over starlette/uvicorn, mypy over ty/pyright as the gate.
-12. **Demo apps.** `examples/next-demo` and `examples/django-demo` live in the repo, so that demos and fixtures never touch employer code.
-
-These came out of the builder review (2026-10-19):
-
-13. **Event identity.** The hook client writes a UUID into `_kk.id`, and transcript events use `file:offset`. Usage is deduped by `message_id`. There is no `seq` counter.
-14. **Pane-to-session binding.** It comes from `$TMUX_PANE`, which the hook client records.
-15. **Clearing the dialog flag.** It is agent-scoped, and `idle_prompt` doesn't block typing.
-16. **Stall.** It counts hook events only, uses a longer threshold while a tool is in flight, and stays off during replay. All alerts clear when their condition goes away.
-17. **Hook shim.** A stable shim that exits 0 when kingkai is gone. `init` uses `git check-ignore` and `.git/info/exclude`.
-18. **Shrinking.** The hook client shrinks payloads instead of dropping them. Every string ends up ≤ 512 characters.
-19. **Paths and the session file.** Integrations send absolute paths, and Python makes them relative to `session.json.root`. The session file is read on each request and cached by mtime.
-20. **`SourceFiles`.** It is a domain-owned port, and the domain re-checks containment.
-21. **`Reference` minting.** It is guarded at runtime by a private sentinel and `PLC2701`. Every typer re-checks the grammar.
-22. **HTTP status.** 200 rather than 202, and 429 is listed.
-23. **Docstrings.** ruff `D` is dropped.
-
----
-
-## 16. Phases (summary; the plan has the detail)
-
-Each phase ends in something that can be demoed, and has exit criteria. The plan lives at `docs/superpowers/plans/2026-10-19-kingkai-roadmap.md`.
+The detail is in `docs/superpowers/plans/2026-10-19-kingkai-roadmap.md`. Each phase ends in something that can be demoed.
 
 | Phase | Delivers | Demo / exit |
 |---|---|---|
-| 0 | Spikes 0a (React source location) and 0b (tmux typing and dialogs). The code is throwaway and never merged. Findings go in `docs/spikes/`. | Q1–Q6 answered. Dialog signatures and real hook fixtures recorded. |
-| 1 | Toolchain, hook client, `init`/`uninstall`, spool, tailers, reducer, TUI with agents, timeline and files | A real Claude Code task with 2 subagents shows a live tree and files |
-| 2 | Detectors, transcript usage and cost, alerts and usage panels, session switcher, `doctor` | A forced failure loop raises RetryLoop. Cost updates live. |
-| 3 | HTTP ingress (S1–S11), reference service, tmux and clipboard typers, overlay, `up`, Next.js snippet, e2e | Alt+click in `examples/next-demo` types `@…#L42 ` into the Claude prompt without submitting |
-| 4 | Django loader and middleware (after the Q9 mini-spike), e2e | The same as Phase 3, from a Django template |
-| 5 | Public polish: README with a GIF recorded on a personal project, docs, a v0.1.0 GitHub release | A fresh clone works end to end following only the README |
-
-### Q-S9: residual risk of typing into a dialog (**decided 2026-10-19: policy (a)**)
-
-Hooks are async and polled, so the domain's dialog flag can be up to a few hundred ms late. The `capture-pane` signature check (§8.4) closes most of that window, but it is a heuristic that depends on Claude Code's UI text. If a dialog is open and missed, the digits in `#L42` could select a menu option. Spike 0b measures whether that can actually happen. The maintainer chose **(a)**. The options were:
-
-- **(a) Default:** layered checks, and kingkai types whenever they all pass. If Spike 0b shows that a dialog *can* be triggered by typed text, kingkai switches to bracketed paste, provided the spike shows a paste can't trigger it.
-- **(b) Strict:** kingkai types only when no turn is open (Claude is idle at the prompt). During a turn, references always go to the clipboard.
-- **(c) Paranoid:** kingkai always uses the clipboard, unless the user presses a key in the kingkai pane to confirm.
+| 0 ✓ | The spikes (`docs/spikes/`) and the fixtures | Done on 2026-10-19 |
+| 1 | Toolchain, hook client, `init`/`uninstall`, spool, tailer, reducer, a TUI with agents, timeline and files | A real Claude Code task with 2 subagents shows a live tree and files |
+| 2 | Detectors, usage and cost, alerts and usage panels, `doctor`, the supervisor, the tabbed layout | A forced failure loop raises RetryLoop, and cost updates live |
+| 3 | HTTP ingress, the reference service, tmux and clipboard typers, the overlay, `up`, the Next snippet, e2e | Alt+click in `examples/next-demo` types `@…#L<n> ` without submitting |
+| 4 | The Q9 mini-spike, the Django loader and middleware, e2e | The same, from a Django template |
+| 5 | README with a GIF (from a personal project), docs, `v0.1.0` | A fresh clone works by following only the README |
