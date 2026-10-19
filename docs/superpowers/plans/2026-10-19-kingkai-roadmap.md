@@ -128,7 +128,7 @@ git commit -m "docs(spikes): record tmux typing findings and claude code fixture
 
 **Exit criteria:**
 - Q3–Q8 are answered.
-- The Q-S9 evidence is written down and the maintainer has picked a policy.
+- The Q-S9 evidence is written down, including whether `send-keys -l` or bracketed paste is the primitive under policy (a).
 - At least 9 hook fixtures and 1 transcript fixture are committed.
 - The grep check is clean.
 
@@ -535,7 +535,7 @@ Fill `pricing.toml` from the official Anthropic pricing page at implementation t
 
 ## Phase 3: Click-to-reference for Next.js
 
-**Prerequisite:** the maintainer has answered Q-S9. The tasks below assume policy (a); policies (b) and (c) only change Task 3.5.
+**Q-S9 is decided: policy (a)**, layered checks, then type. Task 3.5 switches the typing primitive to bracketed paste only if Spike 0b shows that typed text can trigger a dialog and a paste can't.
 
 **Demo:**
 - `kingkai up` in `examples/next-demo` opens tmux with claude on the left and kingkai on the right.

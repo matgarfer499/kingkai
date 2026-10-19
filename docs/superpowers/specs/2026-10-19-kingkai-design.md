@@ -805,9 +805,9 @@ Each phase ends in something that can be demoed, and has exit criteria. The plan
 | 4 | Django loader and middleware (after the Q9 mini-spike), e2e | The same as Phase 3, from a Django template |
 | 5 | Public polish: README with a GIF recorded on a personal project, docs, a v0.1.0 GitHub release | A fresh clone works end to end following only the README |
 
-### Q-S9: residual risk of typing into a dialog (**for the maintainer**)
+### Q-S9: residual risk of typing into a dialog (**decided 2026-10-19: policy (a)**)
 
-Hooks are async and polled, so the domain's dialog flag can be up to a few hundred ms late. The `capture-pane` signature check (§8.4) closes most of that window, but it is a heuristic that depends on Claude Code's UI text. If a dialog is open and missed, the digits in `#L42` could select a menu option. Spike 0b measures whether that can actually happen. One of these policies has to be chosen before Phase 3:
+Hooks are async and polled, so the domain's dialog flag can be up to a few hundred ms late. The `capture-pane` signature check (§8.4) closes most of that window, but it is a heuristic that depends on Claude Code's UI text. If a dialog is open and missed, the digits in `#L42` could select a menu option. Spike 0b measures whether that can actually happen. The maintainer chose **(a)**. The options were:
 
 - **(a) Default:** layered checks, and kingkai types whenever they all pass. If Spike 0b shows that a dialog *can* be triggered by typed text, kingkai switches to bracketed paste, provided the spike shows a paste can't trigger it.
 - **(b) Strict:** kingkai types only when no turn is open (Claude is idle at the prompt). During a turn, references always go to the clipboard.
