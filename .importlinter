@@ -1,0 +1,35 @@
+[importlinter]
+root_package = kingkai
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = layers
+type = layers
+layers =
+    kingkai.ui | kingkai.adapters
+    kingkai.application
+    kingkai.domain
+
+[importlinter:contract:domain-pure]
+name = domain-pure
+type = forbidden
+source_modules =
+    kingkai.domain
+forbidden_modules =
+    asyncio
+    msgspec
+    textual
+    aiohttp
+
+[importlinter:contract:hook-client-stdlib-only]
+name = hook-client-stdlib-only
+type = forbidden
+source_modules =
+    kingkai.hook_client
+forbidden_modules =
+    kingkai.*
+    textual
+    aiohttp
+    msgspec
+    cyclopts
+    django
